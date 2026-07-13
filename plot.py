@@ -1,0 +1,260 @@
+"""
+Plot score distributions and transition heatmaps from lexichash-trace JSON output.
+
+Usage: cargo r -r -- -k 21 --repeat 1000 | python plot.py [--out-dir DIR] [--format png pdf svg ...] [--plots best second transition drift]
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.colors import LogNorm
+from matplotlib.ticker import MultipleLocator
+
+ALL_PLOTS = ["best", "second", "transition", "drift"]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "-o",
+        "--out-dir",
+        type=Path,
+        help="save plots in this directory instead of showing them",
+    )
+    parser.add_argument(
+        "-f",
+        "--format",
+        nargs="+",
+        default=["pdf"],
+        help="file format(s) to save plots as, e.g. --format pdf svg (default: pdf)",
+    )
+    parser.add_argument(
+        "-p",
+        "--plots",
+        nargs="+",
+        choices=ALL_PLOTS,
+        default=ALL_PLOTS,
+        help="which plot(s) to generate: best, second, transition, drift (default: all)",
+    )
+    return parser.parse_args()
+
+
+def fmt_rate(rate):
+    return f"{rate * 100:g}%"
+
+
+def plot_best(data, lo, hi):
+    hists = data["score_histograms"]
+    fig, axes = plt.subplots(1, len(hists), figsize=(4 * len(hists), 3.5), sharey=True)
+    for ax, h in zip(axes, hists):
+        counts = np.array(h["counts"])
+        probs = counts / counts.sum()
+        ax.bar(np.arange(len(probs)), probs)
+        ax.set_xlim(lo - 0.5, hi + 0.5)
+        ax.set_xticks(np.arange(lo, hi + 1))
+        ax.set_title(f"mutation rate = {fmt_rate(h['rate'])}")
+        ax.set_xlabel("score")
+    axes[0].set_ylabel("probability")
+    fig.suptitle(
+        f"Best score distribution ({data['algorithm']}, $k$={data['k']}, len={data['len']}, repeat={data['repeat']})"
+    )
+    fig.tight_layout()
+    return fig
+
+
+def plot_second(data, lo, hi):
+    sb_hists = data["second_best_histograms"]
+    sb_data = []
+    for h in sb_hists:
+        counts = np.array(h["counts"], dtype=float)
+        card_sum = np.array(h["cardinality_sum"], dtype=float)
+        probs = counts / counts.sum()
+        avg_card = np.divide(
+            card_sum, counts, out=np.zeros_like(card_sum), where=counts != 0
+        )
+        sb_data.append((probs, avg_card))
+    max_prob = max(probs.max() for probs, _ in sb_data)
+    max_card = max(avg_card.max() for _, avg_card in sb_data)
+
+    fig, axes = plt.subplots(
+        2,
+        len(sb_hists),
+        figsize=(4 * len(sb_hists), 5),
+        sharex="col",
+        gridspec_kw={"height_ratios": [1, 1], "hspace": 0.05},
+        squeeze=False,
+        layout="constrained",
+    )
+    for col, (h, (probs, avg_card)) in enumerate(zip(sb_hists, sb_data)):
+        ax_top, ax_bot = axes[0, col], axes[1, col]
+        ax_top.bar(np.arange(len(probs)), probs, color="tab:blue")
+        ax_top.set_ylim(0, max_prob * 1.05)
+        ax_top.set_title(f"mutation rate = {fmt_rate(h['rate'])}")
+        ax_top.tick_params(labelbottom=False)
+
+        ax_bot.bar(np.arange(len(avg_card)), avg_card, color="tab:red")
+        ax_bot.set_ylim(
+            max_card * 1.05, 0
+        )  # inverted: 0 touches ax_top, grows downward
+        ax_bot.set_xlim(lo - 0.5, hi + 0.5)
+        ax_bot.set_xticks(np.arange(lo, hi + 1))
+        ax_bot.set_xlabel("second-best score")
+
+        if col > 0:
+            ax_top.set_yticklabels([])
+            ax_bot.set_yticklabels([])
+    axes[0, 0].set_ylabel("probability", color="tab:blue")
+    axes[1, 0].set_ylabel("avg. tied $k$-mers", color="tab:red")
+    fig.suptitle(
+        f"Second-best score distribution ({data['algorithm']}, $k$={data['k']}, len={data['len']}, repeat={data['repeat']})"
+    )
+    return fig
+
+
+def plot_transition(data, lo, hi):
+    bands = data["band_transitions"]
+    prob_matrices = []
+    for b in bands:
+        bsize = b["matrix"]["size"]
+        counts = np.array(b["matrix"]["data"], dtype=float).reshape(bsize, bsize)
+        # normalize by the whole matrix (joint probability), not per-row
+        total = counts.sum()
+        probs = counts / total if total > 0 else counts
+        prob_matrices.append(probs)
+
+    # shared log color scale across bands, so they stay comparable; 0 is
+    # masked out (rendered white) since it has no place on a log scale
+    nonzero = np.concatenate([p[p > 0] for p in prob_matrices])
+    vmin = nonzero.min()
+    vmax = nonzero.max()
+    cmap = plt.get_cmap("YlOrRd").copy()
+    cmap.set_bad("white")
+
+    fig, axes = plt.subplots(1, len(bands), figsize=(4.5 * len(bands), 4))
+    if len(bands) == 1:
+        axes = [axes]
+    for ax, b, probs in zip(axes, bands, prob_matrices):
+        masked = np.ma.masked_equal(probs, 0)
+        im = ax.imshow(
+            masked, origin="lower", cmap=cmap, norm=LogNorm(vmin=vmin, vmax=vmax)
+        )
+        ax.set_xlim(lo - 0.5, hi + 0.5)
+        ax.set_ylim(lo - 0.5, hi + 0.5)
+        ax.set_xticks(np.arange(lo, hi + 1))
+        ax.set_yticks(np.arange(lo, hi + 1))
+        ax.set_xticks(np.arange(lo - 0.5, hi + 1), minor=True)
+        ax.set_yticks(np.arange(lo - 0.5, hi + 1), minor=True)
+        ax.grid(which="minor", color="lightgrey", linewidth=0.5)
+        ax.tick_params(which="minor", bottom=False, left=False)
+        ax.set_title(f"{fmt_rate(b['from_rate'])} → {fmt_rate(b['to_rate'])}")
+        ax.set_xlabel("score after")
+        ax.set_ylabel("score before")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.suptitle(
+        f"Score transition probabilities by mutation-rate band ({data['algorithm']}, log scale)"
+    )
+    fig.tight_layout()
+    return fig
+
+
+def percentile_from_counts(counts, q):
+    counts = np.asarray(counts, dtype=float)
+    total = counts.sum()
+    if total == 0:
+        return 0.0
+    cum = np.cumsum(counts)
+    idx = np.searchsorted(cum, q / 100 * total, side="left")
+    return min(idx, len(counts) - 1)
+
+
+def mean_from_counts(counts):
+    counts = np.asarray(counts, dtype=float)
+    total = counts.sum()
+    if total == 0:
+        return 0.0
+    return np.dot(counts, np.arange(len(counts))) / total
+
+
+def plot_drift(data):
+    drift = data["original_drift"]
+    rates = np.array([p["mutations"] for p in drift]) / data["len"] * 100
+
+    fig, ax = plt.subplots(figsize=(7, 4.5), layout="constrained")
+
+    if data["algorithm"] == "minhash":
+        p_match = np.array([c["counts"][1] / sum(c["counts"]) for c in drift])
+        std = np.sqrt(p_match * (1 - p_match))
+        ax.plot(rates, p_match, color="tab:red", marker="o", markersize=3, label="mean")
+        lo_band, hi_band = np.clip(p_match - std, 0, 1), np.clip(p_match + std, 0, 1)
+        ax.fill_between(rates, lo_band, hi_band, color="tab:red", alpha=0.15)
+        ax.set_ylim(0, 1)
+        ax.set_ylabel("P(original best hash still wins)")
+        ax.yaxis.set_major_locator(MultipleLocator(0.1))
+    else:
+        # LexicHash's drift score is a skewed/bimodal continuous score, so
+        # the envelope comes from exact percentiles of the per-point score
+        # histogram rather than +/- std
+        mean = np.array([mean_from_counts(p["counts"]) for p in drift])
+        median = np.array([percentile_from_counts(p["counts"], 50) for p in drift])
+        q1 = np.array([percentile_from_counts(p["counts"], 25) for p in drift])
+        q3 = np.array([percentile_from_counts(p["counts"], 75) for p in drift])
+        ax.plot(rates, mean, color="tab:red", marker="o", markersize=3, label="mean")
+        ax.plot(
+            rates, median, color="tab:blue", marker="o", markersize=3, label="median"
+        )
+        ax.fill_between(
+            rates, q1, q3, color="tab:blue", alpha=0.15, label="25th-75th percentile"
+        )
+        ax.set_ylim(0, data["k"] + 1)
+        ax.set_ylabel("shared prefix length with original best $k$-mer")
+        ax.yaxis.set_major_locator(MultipleLocator(3))
+
+    ax.set_xlabel("mutation rate")
+    ax.xaxis.set_major_locator(MultipleLocator(1))
+    ax.xaxis.set_major_formatter(lambda x, _: f"{x:g}%")
+    ax.set_title(
+        f"Best $k$-mer drift from original ({data['algorithm']}, $k$={data['k']}, len={data['len']}, repeat={data['repeat']})"
+    )
+    ax.legend()
+    return fig
+
+
+def main():
+    args = parse_args()
+    data = json.load(sys.stdin)
+    figs = {}
+
+    # scores concentrate around log4(len)
+    # crop figures there instead of showing the mostly-empty full 0..k range
+    size = data["k"] + 1
+    center = np.ceil(np.log(data["len"]) / np.log(4))
+    lo = max(0, int(center - 5))
+    hi = min(size - 1, int(center + 5))
+
+    if "best" in args.plots:
+        figs["score_distribution"] = plot_best(data, lo, hi)
+
+    if "second" in args.plots:
+        figs["second_best_score"] = plot_second(data, lo, hi)
+
+    if "transition" in args.plots:
+        figs["transitions"] = plot_transition(data, lo, hi)
+
+    if "drift" in args.plots:
+        figs["drift"] = plot_drift(data)
+
+    if args.out_dir:
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+        for name, f in figs.items():
+            for fmt in args.format:
+                f.savefig(args.out_dir / f"{name}.{fmt}", dpi=300)
+    else:
+        plt.show()
+
+
+if __name__ == "__main__":
+    main()
