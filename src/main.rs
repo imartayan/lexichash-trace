@@ -106,7 +106,7 @@ fn run<S: Sim + Send>(args: &Args, algorithm: &str) -> Output {
                     (sim, seq)
                 },
                 |(sim, seq), _| {
-                    let mask = rand::random::<KT>() << (KT::BITS as usize - 2 * args.k);
+                    let mask = rand::random::<KT>();
                     sim.reset(args.k, mask, seq.as_slice());
 
                     let mut score_hist = vec![vec![0usize; num_states]; RATES.len()];

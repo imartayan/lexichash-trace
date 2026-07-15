@@ -34,6 +34,7 @@ impl Sim for LexicHashSim {
         self.heap.clear();
         self.heap.reserve(num_kmers);
         let shift = KT::BITS as usize - 2 * k;
+        let mask = mask | ((1 << shift) - 1);
         for i in 0..num_kmers {
             let kmer = seq.slice(i..(i + k)).as_u64() << shift;
             self.heap.push(kmer ^ mask);

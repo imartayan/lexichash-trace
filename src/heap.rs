@@ -9,7 +9,7 @@ pub struct LexicHeap {
     coord: Vec<(u8, u32)>,
     /// one level per prefix score,
     /// offset -> (item, index)
-    levels: [Vec<(KT, u32)>; 32],
+    levels: [Vec<(KT, u32)>; 33],
 }
 
 impl Default for LexicHeap {
@@ -24,7 +24,7 @@ impl LexicHeap {
         Self {
             best: (0, KT::MAX, 0),
             coord: Default::default(),
-            levels: Default::default(),
+            levels: core::array::from_fn(|_| Vec::new()),
         }
     }
 
