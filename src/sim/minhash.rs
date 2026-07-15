@@ -2,7 +2,7 @@ use super::Sim;
 use crate::KT;
 use crate::heap::LexicHeap;
 use packed_seq::{PackedSeq, Seq, SeqVec};
-use rand::{RngExt, rngs::SmallRng};
+use rand::{RngExt, rngs::SmallRng, seq::SliceRandom};
 use rustc_hash::FxHasher;
 use std::hash::Hasher;
 
@@ -18,6 +18,7 @@ pub struct MinHashSim {
     /// reused across `mutate_at` calls to avoid a per-mutation allocation
     scratch: Vec<KT>,
     heap: LexicHeap,
+    mut_pos: Vec<u32>,
     rng: SmallRng,
 }
 
@@ -32,6 +33,7 @@ impl Sim for MinHashSim {
             bases: Default::default(),
             scratch: Default::default(),
             heap: Default::default(),
+            mut_pos: Default::default(),
             rng,
         }
     }
@@ -45,6 +47,9 @@ impl Sim for MinHashSim {
         self.seed = seed;
         self.bases = seq.to_vec().into_raw();
         self.bases.resize(self.bases.len() + 16, 0);
+        self.mut_pos.clear();
+        self.mut_pos.extend(0..seq.len() as u32);
+        self.mut_pos.shuffle(&mut self.rng);
         let num_kmers = seq.len() - (k - 1);
         self.heap.clear();
         self.heap.reserve(num_kmers);
@@ -71,7 +76,7 @@ impl Sim for MinHashSim {
 
     #[inline(always)]
     fn mutate(&mut self) {
-        let pos = self.rng.random_range(0..self.seq_len());
+        let pos = self.mut_pos.pop().unwrap_or(0) as usize;
         self.mutate_at(pos);
     }
 
@@ -79,8 +84,8 @@ impl Sim for MinHashSim {
     fn mutate_at(&mut self, pos: usize) {
         let start = pos.saturating_sub(self.k - 1);
         let stop = (pos + 1).min(self.seq_len - (self.k - 1));
-        let delta = self.rng.random_range(0u8..4);
-        xor_base(&mut self.bases, pos, delta);
+        let xor = self.rng.random_range(1..4);
+        xor_base(&mut self.bases, pos, xor);
         self.scratch.clear();
         for i in start..stop {
             let kmer = get_kmer(&self.bases, i, self.k);
@@ -110,8 +115,8 @@ fn get_kmer(bases: &[u8], index: usize, k: usize) -> u64 {
 }
 
 #[inline(always)]
-fn xor_base(bases: &mut [u8], index: usize, delta: u8) {
-    bases[index / 4] ^= delta << (2 * (index % 4));
+fn xor_base(bases: &mut [u8], index: usize, xor: u8) {
+    bases[index / 4] ^= xor << (2 * (index % 4));
 }
 
 #[inline(always)]

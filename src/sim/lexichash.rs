@@ -2,13 +2,14 @@ use super::Sim;
 use crate::KT;
 use crate::heap::LexicHeap;
 use packed_seq::{PackedSeq, Seq};
-use rand::{RngExt, rngs::SmallRng};
+use rand::{RngExt, rngs::SmallRng, seq::SliceRandom};
 
 #[derive(Debug, Clone)]
 pub struct LexicHashSim {
     k: usize,
     seq_len: usize,
     heap: LexicHeap,
+    mut_pos: Vec<u32>,
     rng: SmallRng,
 }
 
@@ -20,6 +21,7 @@ impl Sim for LexicHashSim {
             k: Default::default(),
             seq_len: Default::default(),
             heap: Default::default(),
+            mut_pos: Default::default(),
             rng,
         }
     }
@@ -30,6 +32,9 @@ impl Sim for LexicHashSim {
         assert!(k <= seq.len());
         self.k = k;
         self.seq_len = seq.len();
+        self.mut_pos.clear();
+        self.mut_pos.extend(0..seq.len() as u32);
+        self.mut_pos.shuffle(&mut self.rng);
         let num_kmers = seq.len() - (k - 1);
         self.heap.clear();
         self.heap.reserve(num_kmers);
@@ -58,7 +63,7 @@ impl Sim for LexicHashSim {
 
     #[inline(always)]
     fn mutate(&mut self) {
-        let pos = self.rng.random_range(0..self.seq_len());
+        let pos = self.mut_pos.pop().unwrap_or(0) as usize;
         self.mutate_at(pos);
     }
 
@@ -67,7 +72,7 @@ impl Sim for LexicHashSim {
         let start = pos.saturating_sub(self.k - 1);
         let stop = (pos + 1).min(self.seq_len - (self.k - 1));
         let delta = (self.k - 1).saturating_sub(pos);
-        let first_xor = self.rng.random_range(0..4) << (KT::BITS as usize - 2 * (delta + 1));
+        let first_xor = self.rng.random_range(1..4) << (KT::BITS as usize - 2 * (delta + 1));
         self.heap.update_range(start..stop, first_xor);
     }
 
