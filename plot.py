@@ -12,6 +12,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import LogNorm
+from matplotlib.lines import Line2D
 from matplotlib.ticker import MultipleLocator
 
 ALL_PLOTS = ["best", "second", "transition", "drift"]
@@ -183,7 +184,7 @@ def plot_drift(data):
     drift = data["original_drift"]
     rates = np.array([p["mutations"] for p in drift]) / data["len"] * 100
 
-    fig, ax = plt.subplots(figsize=(7, 4.5), layout="constrained")
+    fig, ax = plt.subplots(figsize=(8.5, 4.5), layout="constrained")
 
     if data["algorithm"] == "minhash":
         p_match = np.array([c["counts"][1] / sum(c["counts"]) for c in drift])
@@ -194,32 +195,66 @@ def plot_drift(data):
         ax.set_ylim(0, 1)
         ax.set_ylabel("P(original best hash still wins)")
         ax.yaxis.set_major_locator(MultipleLocator(0.1))
+        legend_handles = None
     else:
         # LexicHash's drift score is a skewed/bimodal continuous score, so
         # the envelope comes from exact percentiles of the per-point score
         # histogram rather than +/- std
+        percentiles = list(range(10, 100, 10))
+        cmap = plt.get_cmap("cool")
+        colors = cmap(np.linspace(0, 1, len(percentiles)))
+        bold = 2.25
+
+        vals_list = [
+            np.array([percentile_from_counts(p["counts"], q) for p in drift])
+            for q in percentiles
+        ]
+        for lo_vals, hi_vals, color in zip(vals_list, vals_list[1:], colors):
+            ax.fill_between(rates, lo_vals, hi_vals, color=color, alpha=0.15, zorder=0)
+
+        percentile_handles = []
+        for q, color, vals in zip(percentiles, colors, vals_list):
+            linewidth = bold if q == 50 else 1.5
+            label = "median" if q == 50 else f"{q}th"
+            percentile_handles.append(
+                ax.plot(
+                    rates,
+                    vals,
+                    color=color,
+                    marker="o",
+                    markersize=3,
+                    linewidth=linewidth,
+                    label=label,
+                    zorder=5,
+                )[0]
+            )
+
         mean = np.array([mean_from_counts(p["counts"]) for p in drift])
-        median = np.array([percentile_from_counts(p["counts"], 50) for p in drift])
-        q1 = np.array([percentile_from_counts(p["counts"], 25) for p in drift])
-        q3 = np.array([percentile_from_counts(p["counts"], 75) for p in drift])
-        ax.plot(rates, mean, color="tab:red", marker="o", markersize=3, label="mean")
-        ax.plot(
-            rates, median, color="tab:blue", marker="o", markersize=3, label="median"
-        )
-        ax.fill_between(
-            rates, q1, q3, color="tab:blue", alpha=0.15, label="25th-75th percentile"
-        )
+        mean_handle = ax.plot(
+            rates,
+            mean,
+            color="black",
+            marker="o",
+            markersize=3,
+            linewidth=bold,
+            label="mean",
+            zorder=10,
+        )[0]
+
         ax.set_ylim(0, data["k"] + 1)
         ax.set_ylabel("shared prefix length with original best $k$-mer")
         ax.yaxis.set_major_locator(MultipleLocator(3))
 
+        header = Line2D([], [], linestyle="none", label="percentile")
+        legend_handles = [mean_handle, header] + percentile_handles
+
     ax.set_xlabel("mutation rate")
     ax.xaxis.set_major_locator(MultipleLocator(1))
     ax.xaxis.set_major_formatter(lambda x, _: f"{x:g}%")
-    ax.set_title(
+    fig.suptitle(
         f"Best $k$-mer drift from original ({data['algorithm']}, $k$={data['k']}, len={data['len']}, repeat={data['repeat']})"
     )
-    ax.legend()
+    ax.legend(handles=legend_handles, loc="center left", bbox_to_anchor=(1.02, 0.5))
     return fig
 
 
