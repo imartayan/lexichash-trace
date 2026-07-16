@@ -15,7 +15,9 @@ from matplotlib.colors import LogNorm
 from matplotlib.lines import Line2D
 from matplotlib.ticker import MultipleLocator
 
-ALL_PLOTS = ["best", "second", "transition", "drift"]
+from approx import inverse_approx, score
+
+ALL_PLOTS = ["best", "second", "transition", "drift", "inverse"]
 
 
 def parse_args():
@@ -39,7 +41,7 @@ def parse_args():
         nargs="+",
         choices=ALL_PLOTS,
         default=ALL_PLOTS,
-        help="which plot(s) to generate: best, second, transition, drift (default: all)",
+        help="which plot(s) to generate: best, second, transition, drift, inverse (default: all)",
     )
     return parser.parse_args()
 
@@ -241,12 +243,23 @@ def plot_drift(data):
             zorder=10,
         )[0]
 
+        pred = score(data["len"], data["k"], rates / 100)
+        pred_handle = ax.plot(
+            rates,
+            pred,
+            "--",
+            color="tab:orange",
+            linewidth=bold,
+            label="prediction",
+            zorder=20,
+        )[0]
+
         ax.set_ylim(0, data["k"] + 1)
         ax.set_ylabel("shared prefix length with original best $k$-mer")
         ax.yaxis.set_major_locator(MultipleLocator(3))
 
         header = Line2D([], [], linestyle="none", label="percentile")
-        legend_handles = [mean_handle, header] + percentile_handles
+        legend_handles = [mean_handle, pred_handle, header] + percentile_handles
 
     ax.set_xlabel("mutation rate")
     ax.xaxis.set_major_locator(MultipleLocator(1))
@@ -255,6 +268,44 @@ def plot_drift(data):
         f"Best $k$-mer drift from original ({data['algorithm']}, $k$={data['k']}, len={data['len']}, repeat={data['repeat']})"
     )
     ax.legend(handles=legend_handles, loc="center left", bbox_to_anchor=(1.02, 0.5))
+    return fig
+
+
+def plot_inverse(data):
+    drift = data["original_drift"]
+    n, k = data["len"], data["k"]
+    rates = np.array([p["mutations"] for p in drift]) / n * 100
+    means = np.array([mean_from_counts(p["counts"]) for p in drift])
+
+    # inverse_approx's model is only valid for rho up to ~0.1
+    mask = rates <= 10
+    rates, means = rates[mask], means[mask]
+    recovered = inverse_approx(n, k, means) * 100
+
+    fig, ax = plt.subplots(figsize=(8.5, 6), layout="constrained")
+    lim = rates.max()
+    ax.plot(
+        [0, lim], [0, lim], "--", color="grey", linewidth=1, label="identity", zorder=0
+    )
+    ax.plot(
+        rates,
+        recovered,
+        color="tab:orange",
+        marker="o",
+        markersize=3,
+        label="inverse_approx(mean)",
+    )
+    ax.set_xlim(0, lim)
+    ax.set_ylim(0, lim)
+    ax.set_xlabel("true mutation rate")
+    ax.set_ylabel("recovered mutation rate")
+    ax.xaxis.set_major_formatter(lambda x, _: f"{x:g}%")
+    ax.yaxis.set_major_formatter(lambda x, _: f"{x:g}%")
+    ax.set_aspect("equal")
+    fig.suptitle(
+        f"Mutation rate recovery from mean drift score ({data['algorithm']}, $k$={data['k']}, len={data['len']}, repeat={data['repeat']})"
+    )
+    ax.legend()
     return fig
 
 
@@ -281,6 +332,9 @@ def main():
 
     if "drift" in args.plots:
         figs["drift"] = plot_drift(data)
+
+    if "inverse" in args.plots and data["algorithm"] == "lexichash":
+        figs["inverse"] = plot_inverse(data)
 
     if args.out_dir:
         args.out_dir.mkdir(parents=True, exist_ok=True)
