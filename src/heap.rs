@@ -1,13 +1,22 @@
 use crate::KT;
+use branches::{likely, unlikely};
 use core::ops::Range;
+
+const UNTRACKED: u32 = u32::MAX;
 
 #[derive(Debug, Clone)]
 pub struct LexicHeap {
     /// (score, item, index)
     best: (u8, KT, u32),
-    /// index -> (score, offset in level)
+    /// scores below threshold are not stored
+    threshold: u8,
+    /// `score(x) >= threshold` iff `x <= untracked_cutoff`
+    untracked_cutoff: KT,
+    /// index -> (score, offset in level),
+    /// offset is UNTRACKED if score < threshold
     coord: Vec<(u8, u32)>,
     /// one level per prefix score,
+    /// only populated for score >= threshold,
     /// offset -> (item, index)
     levels: [Vec<(KT, u32)>; 33],
 }
@@ -21,11 +30,52 @@ impl Default for LexicHeap {
 impl LexicHeap {
     #[inline(always)]
     pub fn new() -> Self {
+        Self::new_with_threshold(0)
+    }
+
+    #[inline(always)]
+    pub fn new_with_threshold(threshold: u8) -> Self {
         Self {
             best: (0, KT::MAX, 0),
-            coord: Default::default(),
+            coord: Vec::new(),
             levels: core::array::from_fn(|_| Vec::new()),
+            threshold,
+            untracked_cutoff: Self::untracked_cutoff_for(threshold),
         }
+    }
+
+    #[inline(always)]
+    pub fn new_with_best_threshold(k: usize, seq_len: usize, repeat: usize) -> Self {
+        Self::new_with_threshold(Self::best_threshold(k, seq_len, repeat))
+    }
+
+    #[inline(always)]
+    pub fn set_threshold(&mut self, threshold: u8) {
+        self.threshold = threshold;
+        self.untracked_cutoff = Self::untracked_cutoff_for(threshold);
+    }
+
+    #[inline(always)]
+    fn untracked_cutoff_for(threshold: u8) -> KT {
+        KT::MAX.checked_shr(2 * threshold as u32).unwrap_or(0)
+    }
+
+    #[inline(always)]
+    pub fn choose_best_threshold(&mut self, k: usize, seq_len: usize, repeat: usize) -> u8 {
+        let best_threshold = Self::best_threshold(k, seq_len, repeat);
+        self.set_threshold(best_threshold);
+        best_threshold
+    }
+
+    #[inline(always)]
+    fn best_threshold(k: usize, seq_len: usize, repeat: usize) -> u8 {
+        const SAFETY_MARGIN: usize = 10_000;
+        let num_kmers = seq_len - (k - 1);
+        let num_mut = k * num_kmers * repeat;
+        let target_ln_prob = -((num_mut * SAFETY_MARGIN) as f64).ln();
+        let target_ratio = target_ln_prob / (num_kmers as f64);
+        let threshold_f = -0.5 * (-target_ratio.exp_m1()).log2();
+        threshold_f.floor().max(0.) as u8
     }
 
     #[inline(always)]
@@ -51,7 +101,9 @@ impl LexicHeap {
         let mut i = 0;
         while n > 0 {
             let m = n >> 2;
-            self.levels[i].reserve((n - m).wrapping_mul(11).div_ceil(10));
+            if i >= self.threshold as usize {
+                self.levels[i].reserve((n - m).wrapping_mul(11).div_ceil(10));
+            }
             n = m;
             i += 1;
         }
@@ -95,52 +147,66 @@ impl LexicHeap {
     }
 
     #[inline(always)]
-    fn _pop(&mut self, index: usize) -> KT {
-        let (i, j) = self.coord[index];
-        let level = self.levels.get_mut(i as usize).unwrap();
-        let (x, _) = level.swap_remove(j as usize);
-        if let Some(&(_, swap_index)) = level.get(j as usize) {
-            self.coord.swap(index, swap_index as usize);
+    fn _pop(&mut self, index: usize) {
+        let (i, offset) = self.coord[index];
+        if unlikely(offset != UNTRACKED) {
+            let level = self.levels.get_mut(i as usize).unwrap();
+            level.swap_remove(offset as usize);
+            if let Some(&(_, swap_index)) = level.get(offset as usize) {
+                self.coord[swap_index as usize] = (i, offset);
+            }
         }
         // we delay the rescan of best values
-        x
     }
 
     #[inline(always)]
     fn _set(&mut self, index: usize, x: KT) {
+        if likely(x > self.untracked_cutoff) {
+            self.coord[index] = (0, UNTRACKED);
+        } else {
+            self._set_tracked(index, x);
+        }
+    }
+
+    /// Tracked-item half of `_set`, for callers that already know `x <= untracked_cutoff`.
+    #[inline(always)]
+    fn _set_tracked(&mut self, index: usize, x: KT) {
         let i = Self::prefix_score(x);
-        let level = self.levels.get_mut(i as usize).unwrap();
+        let level = &mut self.levels[i as usize];
         self.coord[index] = (i, level.len() as u32);
         level.push((x, index as u32));
-        if x < self.best_item() {
-            self.best = (i, x, index as u32)
+        if unlikely(x < self.best_item()) {
+            self.best = (i, x, index as u32);
         }
     }
 
     #[inline(always)]
     pub fn push(&mut self, x: KT) {
-        let index = self.len();
-        self.coord.push((0, 0));
+        let index = self.coord.len();
+        self.coord.push((0, UNTRACKED));
         self._set(index, x);
     }
 
-    #[inline(always)]
-    pub fn update_range(&mut self, range: Range<usize>, first_xor: KT) {
-        let prev_best_index = self.best_index();
-        for (delta, index) in range.clone().enumerate() {
-            let x = self._pop(index);
-            let x_new = x ^ (first_xor >> (2 * delta));
-            self._set(index, x_new);
+    /// Bulk-populates the heap with `count` items computed via `f`,
+    /// batching the writes instead of pushing one at a time.
+    pub fn init_with_fn(&mut self, count: usize, mut f: impl FnMut(usize) -> KT) {
+        self.reserve(count);
+        self.coord.resize(count, (0, UNTRACKED));
+        for index in 0..count {
+            let x = f(index);
+            if unlikely(x <= self.untracked_cutoff) {
+                self._set_tracked(index, x);
+            }
         }
-        self._rescan_best_if_stale(range, prev_best_index);
     }
 
+    /// Updates `range`, computing each new value via `f`.
     #[inline(always)]
-    pub fn update_range_with(&mut self, range: Range<usize>, values: &[KT]) {
-        debug_assert_eq!(range.len(), values.len());
+    pub fn update_range_with_fn(&mut self, range: Range<usize>, mut f: impl FnMut(usize) -> KT) {
         let prev_best_index = self.best_index();
-        for (index, &x_new) in range.clone().zip(values) {
+        for index in range.clone() {
             self._pop(index);
+            let x_new = f(index);
             self._set(index, x_new);
         }
         self._rescan_best_if_stale(range, prev_best_index);
@@ -159,5 +225,50 @@ impl LexicHeap {
             let min = level.iter().min().unwrap();
             self.best = (i, min.0, min.1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::{RngExt, SeedableRng, rngs::SmallRng};
+
+    /// Drives a threshold=0 heap and an auto-thresholded one through the
+    /// same updates and checks their observable state always matches.
+    #[test]
+    fn threshold_matches_baseline() {
+        let mut rng = SmallRng::seed_from_u64(42);
+        let n = 5_000;
+        let k = 21;
+
+        let mut baseline = LexicHeap::new_with_threshold(0);
+        let mut optimized = LexicHeap::new();
+        let best_threshold = optimized.choose_best_threshold(k, n, 1);
+        dbg!(best_threshold);
+        baseline.reserve(n);
+
+        let initial: Vec<KT> = (0..n).map(|_| rng.random()).collect();
+        for &x in &initial {
+            baseline.push(x);
+        }
+        optimized.init_with_fn(initial.len(), |i| initial[i]);
+        assert_heaps_match(&baseline, &optimized);
+
+        for _ in 0..2_000 {
+            let pos = rng.random_range(0..n);
+            let start = pos.saturating_sub(k - 1);
+            let stop = (pos + 1).min(n - (k - 1));
+            let values: Vec<KT> = (start..stop).map(|_| rng.random()).collect();
+            baseline.update_range_with_fn(start..stop, |i| values[i - start]);
+            optimized.update_range_with_fn(start..stop, |i| values[i - start]);
+            assert_heaps_match(&baseline, &optimized);
+        }
+    }
+
+    fn assert_heaps_match(baseline: &LexicHeap, optimized: &LexicHeap) {
+        assert_eq!(baseline.best_score(), optimized.best_score());
+        assert_eq!(baseline.best_item(), optimized.best_item());
+        assert_eq!(baseline.best_index(), optimized.best_index());
+        assert_eq!(baseline.second_bests(), optimized.second_bests());
     }
 }

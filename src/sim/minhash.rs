@@ -1,4 +1,5 @@
 use super::Sim;
+use super::packed_bases::{get_kmer, xor_base};
 use crate::KT;
 use crate::heap::LexicHeap;
 use packed_seq::{PackedSeq, Seq, SeqVec};
@@ -15,8 +16,6 @@ pub struct MinHashSim {
     /// `[2*(i%4), 2*(i%4)+2)` of byte `i/4`, padded with 16 trailing zero bytes
     /// so `get_kmer` can always safely read a full `u128` at any valid offset.
     bases: Vec<u8>,
-    /// reused across `mutate_at` calls to avoid a per-mutation allocation
-    scratch: Vec<KT>,
     heap: LexicHeap,
     mut_pos: Vec<u32>,
     rng: SmallRng,
@@ -31,7 +30,6 @@ impl Sim for MinHashSim {
             seq_len: Default::default(),
             seed: Default::default(),
             bases: Default::default(),
-            scratch: Default::default(),
             heap: Default::default(),
             mut_pos: Default::default(),
             rng,
@@ -52,11 +50,10 @@ impl Sim for MinHashSim {
         self.mut_pos.shuffle(&mut self.rng);
         let num_kmers = seq.len() - (k - 1);
         self.heap.clear();
-        self.heap.reserve(num_kmers);
-        for i in 0..num_kmers {
-            let kmer = get_kmer(&self.bases, i, k);
-            self.heap.push(hash(kmer, seed));
-        }
+        self.heap.choose_best_threshold(k, seq.len(), 10_000);
+        let bases = &self.bases;
+        self.heap
+            .init_with_fn(num_kmers, |i| hash(get_kmer(bases, i, k), seed));
     }
 
     #[inline(always)]
@@ -75,6 +72,11 @@ impl Sim for MinHashSim {
     }
 
     #[inline(always)]
+    fn heap_mut(&mut self) -> &mut LexicHeap {
+        &mut self.heap
+    }
+
+    #[inline(always)]
     fn mutate(&mut self) {
         let pos = self.mut_pos.pop().unwrap_or(0) as usize;
         self.mutate_at(pos);
@@ -86,12 +88,9 @@ impl Sim for MinHashSim {
         let stop = (pos + 1).min(self.seq_len - (self.k - 1));
         let xor = self.rng.random_range(1..4);
         xor_base(&mut self.bases, pos, xor);
-        self.scratch.clear();
-        for i in start..stop {
-            let kmer = get_kmer(&self.bases, i, self.k);
-            self.scratch.push(hash(kmer, self.seed));
-        }
-        self.heap.update_range_with(start..stop, &self.scratch);
+        let (bases, k, seed) = (&self.bases, self.k, self.seed);
+        self.heap
+            .update_range_with_fn(start..stop, |i| hash(get_kmer(bases, i, k), seed));
     }
 
     #[inline(always)]
@@ -103,20 +102,6 @@ impl Sim for MinHashSim {
     fn drift_buckets(_k: usize) -> usize {
         2
     }
-}
-
-#[inline(always)]
-fn get_kmer(bases: &[u8], index: usize, k: usize) -> u64 {
-    let byte_idx = index / 4;
-    let bit_offset = 2 * (index % 4);
-    let chunk = u128::from_le_bytes(bases[byte_idx..byte_idx + 16].try_into().unwrap());
-    let mask = (1u128 << (2 * k)) - 1;
-    ((chunk >> bit_offset) & mask) as u64
-}
-
-#[inline(always)]
-fn xor_base(bases: &mut [u8], index: usize, xor: u8) {
-    bases[index / 4] ^= xor << (2 * (index % 4));
 }
 
 #[inline(always)]

@@ -1,13 +1,22 @@
 use super::Sim;
+use super::packed_bases::{get_kmer, xor_base};
 use crate::KT;
 use crate::heap::LexicHeap;
-use packed_seq::{PackedSeq, Seq};
+use packed_seq::{PackedSeq, Seq, SeqVec};
 use rand::{RngExt, rngs::SmallRng, seq::SliceRandom};
 
 #[derive(Debug, Clone)]
 pub struct LexicHashSim {
     k: usize,
     seq_len: usize,
+    mask: KT,
+    /// `KT::BITS - 2*k`: left-shift that aligns a k-mer's packed bits to the
+    /// top of `KT`, so prefix comparisons order by shared-prefix length
+    shift: usize,
+    /// 2-bit-packed bases, same layout as `packed_seq`: base `i` lives in bits
+    /// `[2*(i%4), 2*(i%4)+2)` of byte `i/4`, padded with 16 trailing zero bytes
+    /// so `get_kmer` can always safely read a full `u128` at any valid offset.
+    bases: Vec<u8>,
     heap: LexicHeap,
     mut_pos: Vec<u32>,
     rng: SmallRng,
@@ -20,6 +29,9 @@ impl Sim for LexicHashSim {
         Self {
             k: Default::default(),
             seq_len: Default::default(),
+            mask: Default::default(),
+            shift: Default::default(),
+            bases: Default::default(),
             heap: Default::default(),
             mut_pos: Default::default(),
             rng,
@@ -32,18 +44,19 @@ impl Sim for LexicHashSim {
         assert!(k <= seq.len());
         self.k = k;
         self.seq_len = seq.len();
+        self.shift = KT::BITS as usize - 2 * k;
+        self.mask = mask | ((1 << self.shift) - 1);
+        self.bases = seq.to_vec().into_raw();
+        self.bases.resize(self.bases.len() + 16, 0);
         self.mut_pos.clear();
         self.mut_pos.extend(0..seq.len() as u32);
         self.mut_pos.shuffle(&mut self.rng);
         let num_kmers = seq.len() - (k - 1);
         self.heap.clear();
-        self.heap.reserve(num_kmers);
-        let shift = KT::BITS as usize - 2 * k;
-        let mask = mask | ((1 << shift) - 1);
-        for i in 0..num_kmers {
-            let kmer = seq.slice(i..(i + k)).as_u64() << shift;
-            self.heap.push(kmer ^ mask);
-        }
+        self.heap.choose_best_threshold(k, seq.len(), 10_000);
+        let (bases, shift, mask) = (&self.bases, self.shift, self.mask);
+        self.heap
+            .init_with_fn(num_kmers, |i| (get_kmer(bases, i, k) << shift) ^ mask);
     }
 
     #[inline(always)]
@@ -62,6 +75,11 @@ impl Sim for LexicHashSim {
     }
 
     #[inline(always)]
+    fn heap_mut(&mut self) -> &mut LexicHeap {
+        &mut self.heap
+    }
+
+    #[inline(always)]
     fn mutate(&mut self) {
         let pos = self.mut_pos.pop().unwrap_or(0) as usize;
         self.mutate_at(pos);
@@ -71,9 +89,11 @@ impl Sim for LexicHashSim {
     fn mutate_at(&mut self, pos: usize) {
         let start = pos.saturating_sub(self.k - 1);
         let stop = (pos + 1).min(self.seq_len - (self.k - 1));
-        let delta = (self.k - 1).saturating_sub(pos);
-        let first_xor = self.rng.random_range(1..4) << (KT::BITS as usize - 2 * (delta + 1));
-        self.heap.update_range(start..stop, first_xor);
+        let xor = self.rng.random_range(1..4);
+        xor_base(&mut self.bases, pos, xor);
+        let (bases, k, shift, mask) = (&self.bases, self.k, self.shift, self.mask);
+        self.heap
+            .update_range_with_fn(start..stop, |i| (get_kmer(bases, i, k) << shift) ^ mask);
     }
 
     #[inline(always)]

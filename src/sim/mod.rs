@@ -4,6 +4,7 @@ use packed_seq::PackedSeq;
 
 mod lexichash;
 mod minhash;
+mod packed_bases;
 
 pub use lexichash::LexicHashSim;
 pub use minhash::MinHashSim;
@@ -15,6 +16,7 @@ pub trait Sim: Sized {
     fn k(&self) -> usize;
     fn seq_len(&self) -> usize;
     fn heap(&self) -> &LexicHeap;
+    fn heap_mut(&mut self) -> &mut LexicHeap;
     fn mutate(&mut self);
     fn mutate_at(&mut self, pos: usize);
     /// Bucket index for "current best vs `original`", used for the drift-from-original plot.
