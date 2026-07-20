@@ -15,7 +15,8 @@ from matplotlib.colors import LogNorm
 from matplotlib.lines import Line2D
 from matplotlib.ticker import MultipleLocator
 
-from approx import inverse_approx, score
+import approx.lexichash as lh
+import approx.minhash as mh
 
 ALL_PLOTS = ["best", "second", "transition", "drift", "inverse"]
 
@@ -187,17 +188,25 @@ def plot_drift(data):
     rates = np.array([p["mutations"] for p in drift]) / data["len"] * 100
 
     fig, ax = plt.subplots(figsize=(8.5, 4.5), layout="constrained")
+    bold = 2.25
 
     if data["algorithm"] == "minhash":
         p_match = np.array([c["counts"][1] / sum(c["counts"]) for c in drift])
         std = np.sqrt(p_match * (1 - p_match))
-        ax.plot(rates, p_match, color="tab:red", marker="o", markersize=3, label="mean")
+        mean_handle = ax.plot(
+            rates, p_match, color="tab:red", marker="o", markersize=3, label="mean"
+        )[0]
         lo_band, hi_band = np.clip(p_match - std, 0, 1), np.clip(p_match + std, 0, 1)
         ax.fill_between(rates, lo_band, hi_band, color="tab:red", alpha=0.15)
         ax.set_ylim(0, 1)
         ax.set_ylabel("P(original best hash still wins)")
         ax.yaxis.set_major_locator(MultipleLocator(0.1))
-        legend_handles = None
+
+        pred = mh.score(data["k"], rates / 100)
+        pred_handle = ax.plot(
+            rates, pred, "--", color="tab:orange", linewidth=bold, label="prediction"
+        )[0]
+        legend_handles = [mean_handle, pred_handle]
     else:
         # LexicHash's drift score is a skewed/bimodal continuous score, so
         # the envelope comes from exact percentiles of the per-point score
@@ -205,7 +214,6 @@ def plot_drift(data):
         percentiles = list(range(10, 100, 10))
         cmap = plt.get_cmap("cool")
         colors = cmap(np.linspace(0, 1, len(percentiles)))
-        bold = 2.25
 
         vals_list = [
             np.array([percentile_from_counts(p["counts"], q) for p in drift])
@@ -243,7 +251,7 @@ def plot_drift(data):
             zorder=10,
         )[0]
 
-        pred = score(data["len"], data["k"], rates / 100)
+        pred = lh.score(data["len"], data["k"], rates / 100)
         pred_handle = ax.plot(
             rates,
             pred,
@@ -275,12 +283,19 @@ def plot_inverse(data):
     drift = data["original_drift"]
     n, k = data["len"], data["k"]
     rates = np.array([p["mutations"] for p in drift]) / n * 100
-    means = np.array([mean_from_counts(p["counts"]) for p in drift])
 
     # inverse_approx's model is only valid for rho up to ~0.1
     mask = rates <= 10
-    rates, means = rates[mask], means[mask]
-    recovered = inverse_approx(n, k, means) * 100
+    rates = rates[mask]
+
+    if data["algorithm"] == "minhash":
+        p_match = np.array([c["counts"][1] / sum(c["counts"]) for c in drift])[mask]
+        recovered = mh.inverse_approx(k, p_match) * 100
+        label = "inverse_approx(p_match)"
+    else:
+        means = np.array([mean_from_counts(p["counts"]) for p in drift])[mask]
+        recovered = lh.inverse_approx(n, k, means) * 100
+        label = "inverse_approx(mean)"
 
     fig, ax = plt.subplots(figsize=(8.5, 6), layout="constrained")
     lim = rates.max()
@@ -293,7 +308,7 @@ def plot_inverse(data):
         color="tab:orange",
         marker="o",
         markersize=3,
-        label="inverse_approx(mean)",
+        label=label,
     )
     ax.set_xlim(0, lim)
     ax.set_ylim(0, lim)
@@ -333,7 +348,7 @@ def main():
     if "drift" in args.plots:
         figs["drift"] = plot_drift(data)
 
-    if "inverse" in args.plots and data["algorithm"] == "lexichash":
+    if "inverse" in args.plots:
         figs["inverse"] = plot_inverse(data)
 
     if args.out_dir:
