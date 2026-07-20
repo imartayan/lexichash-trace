@@ -1,20 +1,23 @@
 use crate::KT;
-use branches::{likely, unlikely};
+use branches::unlikely;
 use core::ops::Range;
+use rustc_hash::FxHashMap;
 
-const UNTRACKED: u32 = u32::MAX;
+/// Offset-within-a-level type.
+type OT = u16;
 
 #[derive(Debug, Clone)]
 pub struct LexicHeap {
-    /// (score, item, index)
-    best: (u8, KT, u32),
+    /// total number of items ever set (tracked or not)
+    count: usize,
     /// scores below threshold are not stored
     threshold: u8,
     /// `score(x) >= threshold` iff `x <= untracked_cutoff`
     untracked_cutoff: KT,
-    /// index -> (score, offset in level),
-    /// offset is UNTRACKED if score < threshold
-    coord: Vec<(u8, u32)>,
+    /// (score, item, index)
+    best: (u8, KT, u32),
+    /// index -> (score, offset in level), absent iff score < threshold
+    coord: FxHashMap<u32, (u8, OT)>,
     /// one level per prefix score,
     /// only populated for score >= threshold,
     /// offset -> (item, index)
@@ -36,8 +39,9 @@ impl LexicHeap {
     #[inline(always)]
     pub fn new_with_threshold(threshold: u8) -> Self {
         Self {
+            count: 0,
             best: (0, KT::MAX, 0),
-            coord: Vec::new(),
+            coord: FxHashMap::default(),
             levels: core::array::from_fn(|_| Vec::new()),
             threshold,
             untracked_cutoff: Self::untracked_cutoff_for(threshold),
@@ -80,6 +84,7 @@ impl LexicHeap {
 
     #[inline(always)]
     pub fn clear(&mut self) {
+        self.count = 0;
         self.best = (0, KT::MAX, 0);
         self.coord.clear();
         self.levels.iter_mut().for_each(|level| level.clear());
@@ -87,26 +92,30 @@ impl LexicHeap {
 
     #[inline(always)]
     pub fn len(&self) -> usize {
-        self.coord.len()
+        self.count
     }
 
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.count == 0
     }
 
     pub fn reserve(&mut self, additional: usize) {
-        self.coord.reserve(additional);
         let mut n = additional;
         let mut i = 0;
+        let mut tracked_estimate = 0;
         while n > 0 {
             let m = n >> 2;
             if i >= self.threshold as usize {
-                self.levels[i].reserve((n - m).wrapping_mul(11).div_ceil(10));
+                let level_capacity = (n - m).wrapping_mul(11).div_ceil(10);
+                self.levels[i].reserve(level_capacity);
+                tracked_estimate += level_capacity;
             }
             n = m;
             i += 1;
         }
+        // reserve at 2x the expected tracked count
+        self.coord.reserve(tracked_estimate * 2);
     }
 
     #[inline(always)]
@@ -148,12 +157,11 @@ impl LexicHeap {
 
     #[inline(always)]
     fn _pop(&mut self, index: usize) {
-        let (i, offset) = self.coord[index];
-        if unlikely(offset != UNTRACKED) {
-            let level = self.levels.get_mut(i as usize).unwrap();
+        if let Some((i, offset)) = self.coord.remove(&(index as u32)) {
+            let level = &mut self.levels[i as usize];
             level.swap_remove(offset as usize);
             if let Some(&(_, swap_index)) = level.get(offset as usize) {
-                self.coord[swap_index as usize] = (i, offset);
+                self.coord.insert(swap_index, (i, offset));
             }
         }
         // we delay the rescan of best values
@@ -161,9 +169,7 @@ impl LexicHeap {
 
     #[inline(always)]
     fn _set(&mut self, index: usize, x: KT) {
-        if likely(x > self.untracked_cutoff) {
-            self.coord[index] = (0, UNTRACKED);
-        } else {
+        if unlikely(x <= self.untracked_cutoff) {
             self._set_tracked(index, x);
         }
     }
@@ -173,8 +179,9 @@ impl LexicHeap {
     fn _set_tracked(&mut self, index: usize, x: KT) {
         let i = Self::prefix_score(x);
         let level = &mut self.levels[i as usize];
-        self.coord[index] = (i, level.len() as u32);
+        let offset = OT::try_from(level.len()).expect("level exceeds OT capacity");
         level.push((x, index as u32));
+        self.coord.insert(index as u32, (i, offset));
         if unlikely(x < self.best_item()) {
             self.best = (i, x, index as u32);
         }
@@ -182,16 +189,15 @@ impl LexicHeap {
 
     #[inline(always)]
     pub fn push(&mut self, x: KT) {
-        let index = self.coord.len();
-        self.coord.push((0, UNTRACKED));
+        let index = self.count;
+        self.count += 1;
         self._set(index, x);
     }
 
-    /// Bulk-populates the heap with `count` items computed via `f`,
-    /// batching the writes instead of pushing one at a time.
+    /// Bulk-populates the heap with `count` items computed via `f`.
     pub fn init_with_fn(&mut self, count: usize, mut f: impl FnMut(usize) -> KT) {
         self.reserve(count);
-        self.coord.resize(count, (0, UNTRACKED));
+        self.count = count;
         for index in 0..count {
             let x = f(index);
             if unlikely(x <= self.untracked_cutoff) {
