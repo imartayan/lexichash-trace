@@ -1,7 +1,7 @@
 """
 Plot score distributions and transition heatmaps from lexichash-trace JSON output.
 
-Usage: cargo r -r -- -k 21 --repeat 1000 | python plot.py [--out-dir DIR] [--format png pdf svg ...] [--plots best second transition drift]
+Usage: cargo r -r -- -k 21 --repeat 1000 | python plot.py [--out-dir DIR] [--format png pdf svg ...] [--plots best second transition drift inverse]
 """
 
 import argparse

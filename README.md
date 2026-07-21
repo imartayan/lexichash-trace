@@ -44,15 +44,16 @@ or directly
 ./lexichash-trace | python3 plot.py
 ```
 
-It reads the JSON from stdin and generates four plots:
+It reads the JSON from stdin and generates five plots:
 - best-score distribution (`best`)
 - second-best score distribution (`second`)
 - score transitions (`transition`)
 - drift of the selected *k*-mer from the original as mutations increase (`drift`)
+- mutation rate recovered from the drift signal vs the true rate (`inverse`)
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `-p, --plots <best second transition drift>` | which plot(s) to generate | all four |
+| `-p, --plots <best second transition drift inverse>` | which plot(s) to generate | all five |
 | `-o, --out-dir <DIR>` | save plots here instead of showing them | show interactively |
 | `-f, --format <pdf svg png>` | output format(s), only used with `-o` | `pdf` |
 
