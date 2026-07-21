@@ -2,16 +2,16 @@ use super::Sim;
 use super::packed_bases::{get_kmer, xor_base};
 use crate::KT;
 use crate::heap::LexicHeap;
+use core::hash::BuildHasher;
 use packed_seq::{PackedSeq, Seq, SeqVec};
 use rand::{RngExt, rngs::SmallRng, seq::SliceRandom};
-use rustc_hash::FxHasher;
-use std::hash::Hasher;
+use rapidhash::quality::SeedableState;
 
 #[derive(Debug, Clone)]
 pub struct MinHashSim {
     k: usize,
     seq_len: usize,
-    seed: KT,
+    hasher: SeedableState<'static>,
     /// 2-bit-packed bases, same layout as `packed_seq`: base `i` lives in bits
     /// `[2*(i%4), 2*(i%4)+2)` of byte `i/4`, padded with 16 trailing zero bytes
     /// so `get_kmer` can always safely read a full `u128` at any valid offset.
@@ -28,7 +28,7 @@ impl Sim for MinHashSim {
         Self {
             k: Default::default(),
             seq_len: Default::default(),
-            seed: Default::default(),
+            hasher: SeedableState::fixed(),
             bases: Default::default(),
             heap: Default::default(),
             mut_pos: Default::default(),
@@ -42,7 +42,7 @@ impl Sim for MinHashSim {
         assert!(k <= seq.len());
         self.k = k;
         self.seq_len = seq.len();
-        self.seed = seed;
+        self.hasher = SeedableState::new(seed);
         self.bases = seq.to_vec().into_raw();
         self.bases.resize(self.bases.len() + 16, 0);
         self.mut_pos.clear();
@@ -51,9 +51,9 @@ impl Sim for MinHashSim {
         let num_kmers = seq.len() - (k - 1);
         self.heap.clear();
         self.heap.choose_best_threshold(k, seq.len(), 10_000);
-        let bases = &self.bases;
+        let (bases, hasher) = (&self.bases, &self.hasher);
         self.heap
-            .init_with_fn(num_kmers, |i| hash(get_kmer(bases, i, k), seed));
+            .init_with_fn(num_kmers, |i| hash(get_kmer(bases, i, k), hasher));
     }
 
     #[inline(always)]
@@ -88,9 +88,9 @@ impl Sim for MinHashSim {
         let stop = (pos + 1).min(self.seq_len - (self.k - 1));
         let xor = self.rng.random_range(1..4);
         xor_base(&mut self.bases, pos, xor);
-        let (bases, k, seed) = (&self.bases, self.k, self.seed);
+        let (bases, k, hasher) = (&self.bases, self.k, &self.hasher);
         self.heap
-            .update_range_with_fn(start..stop, |i| hash(get_kmer(bases, i, k), seed));
+            .update_range_with_fn(start..stop, |i| hash(get_kmer(bases, i, k), hasher));
     }
 
     #[inline(always)]
@@ -105,8 +105,6 @@ impl Sim for MinHashSim {
 }
 
 #[inline(always)]
-fn hash(x: KT, seed: KT) -> KT {
-    let mut hasher = FxHasher::default();
-    hasher.write_u64(x ^ seed);
-    hasher.finish()
+fn hash(x: KT, hasher: &SeedableState<'static>) -> KT {
+    hasher.hash_one(x)
 }
