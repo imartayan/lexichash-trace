@@ -68,6 +68,52 @@ def score_approx(n, k, rho):
     return Sigma_Phi + w * T
 
 
+def _score_and_deriv(n, k, rho):
+    """`score(n, k, rho)` and its exact derivative d(score)/d(rho), both O(k)."""
+    rho = np.asarray(rho, dtype=float)
+    j = np.arange(1, k + 1)[:, None]
+    Phi = _phi(k, n)[:, None]
+    m = _log4(n) - 0.8
+    w = 1.0 / (1.0 + m * rho)
+    e = (1.0 - Phi) * np.exp(-j * rho)
+    s = (Phi + e * w).sum(0)
+    ds = (e * (-m * w**2 - j * w)).sum(0)
+    return s, ds
+
+
+def inverse(n, k, target_score, rho_max=1.0, bisect_iters=40, newton_iters=4):
+    """Exact inverse of `score`: recover rho from (n, k, score).
+
+    `score` is strictly decreasing in rho (each term is a product of positive
+    decreasing factors), so the root is unique: bisect on [0, rho_max] for a
+    robust seed (no dependence on the small-rho model behind `inverse_approx`),
+    then polish with a few Newton steps against score's own exact derivative,
+    which reach float64 precision from a bisected seed.
+    """
+    target_score = np.asarray(target_score, dtype=float)
+    lo_bound, hi_bound = score(n, k, rho_max).item(), score(n, k, 0.0).item()
+    if np.any(target_score <= lo_bound) or np.any(target_score > hi_bound):
+        raise ValueError(
+            f"score out of range for rho_max={rho_max}: expected "
+            f"{lo_bound:g} < score <= {hi_bound:g}."
+        )
+
+    rho_lo = np.zeros_like(target_score)
+    rho_hi = np.full_like(target_score, rho_max)
+    for _ in range(bisect_iters):
+        mid = 0.5 * (rho_lo + rho_hi)
+        too_high = score(n, k, mid) > target_score
+        rho_lo = np.where(too_high, mid, rho_lo)
+        rho_hi = np.where(too_high, rho_hi, mid)
+    rho = 0.5 * (rho_lo + rho_hi)
+
+    for _ in range(newton_iters):
+        s, ds = _score_and_deriv(n, k, rho)
+        rho = np.clip(rho - (s - target_score) / ds, 0.0, None)
+
+    return rho
+
+
 def _seed(score, m, Sigma_Phi, E0, B1, B2):
     """Closed-form quadratic-in-log seed (see inverse_approx docstring)."""
     R = (score - Sigma_Phi) / E0

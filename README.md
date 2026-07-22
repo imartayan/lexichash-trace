@@ -25,6 +25,7 @@ cp target/release/lexichash-trace .
 | `-r, --repeat <N>` | number of independent repeats | 1000 |
 | `-t, --threads <N>` | size of the thread pool | all cores |
 | `--minhash` | use MinHash instead of LexicHash | off (LexicHash) |
+| `--converge-rate <RATE>` | mutation rate at which to track convergence of the empirical mean drift score to its prediction | 0.05 |
 
 Each repeat mutates the sequence one random base at a time, up to 10% of its
 length, running all repeats in parallel. Along the way it samples the current
@@ -44,16 +45,18 @@ or directly
 ./lexichash-trace | python3 plot.py
 ```
 
-It reads the JSON from stdin and generates five plots:
+It reads the JSON from stdin and generates different plots:
 - best-score distribution (`best`)
 - second-best score distribution (`second`)
 - score transitions (`transition`)
 - drift of the selected *k*-mer from the original as mutations increase (`drift`)
 - mutation rate recovered from the drift signal vs the true rate (`inverse`)
+- convergence of the empirical mean drift score to its prediction as sketch size grows, at the fixed `--converge-rate` (`converge`)
+- convergence of the mutation rate recovered from that empirical score to the true rate, as sketch size grows (`converge-inverse`)
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `-p, --plots <best second transition drift inverse>` | which plot(s) to generate | all five |
+| `-p, --plots <best second transition drift inverse converge converge-inverse>` | which plot(s) to generate | all |
 | `-o, --out-dir <DIR>` | save plots here instead of showing them | show interactively |
 | `-f, --format <pdf svg png>` | output format(s), only used with `-o` | `pdf` |
 

@@ -18,7 +18,15 @@ from matplotlib.ticker import MultipleLocator
 import approx.lexichash as lh
 import approx.minhash as mh
 
-ALL_PLOTS = ["best", "second", "transition", "drift", "inverse"]
+ALL_PLOTS = [
+    "best",
+    "second",
+    "transition",
+    "drift",
+    "inverse",
+    "converge",
+    "converge-inverse",
+]
 
 
 def parse_args():
@@ -42,13 +50,81 @@ def parse_args():
         nargs="+",
         choices=ALL_PLOTS,
         default=ALL_PLOTS,
-        help="which plot(s) to generate: best, second, transition, drift, inverse (default: all)",
+        help="which plot(s) to generate: best, second, transition, drift, inverse, converge, converge-inverse (default: all)",
     )
     return parser.parse_args()
 
 
 def fmt_rate(rate):
     return f"{rate * 100:g}%"
+
+
+def forward_prediction(data, rho):
+    """Predicted mean drift score at substitution rate(s) `rho`, dispatching on algorithm."""
+    if data["algorithm"] == "minhash":
+        return mh.score(data["k"], rho)
+    return lh.score(data["len"], data["k"], rho)
+
+
+def inverse_prediction(data, score):
+    """Recovered mutation rate from empirical drift score(s), dispatching on algorithm."""
+    if data["algorithm"] == "minhash":
+        return mh.inverse(data["k"], score)
+    return lh.inverse(data["len"], data["k"], score)
+
+
+def block_group_means(blocks, min_groups=10):
+    """Regroup disjoint `blocks` (each `{repeats, sum}`) into windows of `q`
+    consecutive blocks, for increasing `q`, stopping once fewer than
+    `min_groups` independent windows remain. Blocks are i.i.d., so this
+    yields, for each sketch size, several independent samples of the mean
+    at that size instead of just one point on a single noisy trajectory.
+
+    Yields (sketch_size, group_means) pairs, where sketch_size is the
+    average number of repeats per window and group_means holds one
+    empirical mean per independent window.
+    """
+    counts = np.array([b["repeats"] for b in blocks])
+    sums = np.array([b["sum"] for b in blocks])
+    num_blocks = len(counts)
+    max_q = num_blocks // min_groups
+    for q in range(1, max_q + 1):
+        num_groups = num_blocks // q
+        c = counts[: num_groups * q].reshape(num_groups, q).sum(axis=1)
+        s = sums[: num_groups * q].reshape(num_groups, q).sum(axis=1)
+        yield c.mean(), s / c
+
+
+def plot_gap_vs_sketch_size(
+    xs, gap_mean, gap_std, color, ylabel, title, fit_reference=True
+):
+    fig, ax = plt.subplots(figsize=(8.5, 5), layout="constrained")
+    lo = np.clip(gap_mean - gap_std, 0, None)
+    ax.fill_between(xs, lo, gap_mean + gap_std, color=color, alpha=0.15)
+    ax.plot(xs, gap_mean, color=color, marker="o", markersize=3, label="mean gap")
+
+    inv_sqrt_xs = 1.0 / np.sqrt(xs)
+    if fit_reference:
+        # C/sqrt(n) reference, with C fit by least squares (equivalent to
+        # minimizing RMSE against gap_mean, since C enters linearly)
+        C = np.sum(gap_mean * inv_sqrt_xs) / np.sum(inv_sqrt_xs**2)
+    else:
+        C = 1.0
+    ref = C * inv_sqrt_xs
+    ax.plot(
+        xs,
+        ref,
+        "--",
+        color="grey",
+        linewidth=1,
+        label=rf"${C:.2g}/\sqrt{{n}}$ reference",
+    )
+
+    ax.set_xlabel("number of sketched $k$-mers")
+    ax.set_ylabel(ylabel)
+    fig.suptitle(title)
+    ax.legend()
+    return fig
 
 
 def plot_best(data, lo, hi):
@@ -202,7 +278,7 @@ def plot_drift(data):
         ax.set_ylabel("P(original best hash still wins)")
         ax.yaxis.set_major_locator(MultipleLocator(0.1))
 
-        pred = mh.score(data["k"], rates / 100)
+        pred = forward_prediction(data, rates / 100)
         pred_handle = ax.plot(
             rates, pred, "--", color="tab:orange", linewidth=bold, label="prediction"
         )[0]
@@ -251,7 +327,7 @@ def plot_drift(data):
             zorder=10,
         )[0]
 
-        pred = lh.score(data["len"], data["k"], rates / 100)
+        pred = forward_prediction(data, rates / 100)
         pred_handle = ax.plot(
             rates,
             pred,
@@ -281,21 +357,15 @@ def plot_drift(data):
 
 def plot_inverse(data):
     drift = data["original_drift"]
-    n, k = data["len"], data["k"]
+    n = data["len"]
     rates = np.array([p["mutations"] for p in drift]) / n * 100
 
-    # inverse_approx's model is only valid for rho up to ~0.1
-    mask = rates <= 10
-    rates = rates[mask]
-
     if data["algorithm"] == "minhash":
-        p_match = np.array([c["counts"][1] / sum(c["counts"]) for c in drift])[mask]
-        recovered = mh.inverse_approx(k, p_match) * 100
-        label = "inverse_approx(p_match)"
+        scores = np.array([c["counts"][1] / sum(c["counts"]) for c in drift])
     else:
-        means = np.array([mean_from_counts(p["counts"]) for p in drift])[mask]
-        recovered = lh.inverse_approx(n, k, means) * 100
-        label = "inverse_approx(mean)"
+        scores = np.array([mean_from_counts(p["counts"]) for p in drift])
+    recovered = inverse_prediction(data, scores) * 100
+    label = "inverse(empirical score)"
 
     fig, ax = plt.subplots(figsize=(8.5, 6), layout="constrained")
     lim = rates.max()
@@ -318,10 +388,68 @@ def plot_inverse(data):
     ax.yaxis.set_major_formatter(lambda x, _: f"{x:g}%")
     ax.set_aspect("equal")
     fig.suptitle(
-        f"Mutation rate recovery from mean drift score ({data['algorithm']}, $k$={data['k']}, len={data['len']}, repeat={data['repeat']})"
+        f"Mutation rate recovery from mean empirical score ({data['algorithm']}, $k$={data['k']}, len={data['len']}, repeat={data['repeat']})"
     )
     ax.legend()
     return fig
+
+
+def plot_converge(data):
+    conv = data["convergence"]
+    pred = forward_prediction(data, conv["rate"])
+
+    xs, gap_mean, gap_std = [], [], []
+    for x, means in block_group_means(conv["blocks"]):
+        gaps = np.abs(means - pred) / pred
+        xs.append(x)
+        gap_mean.append(gaps.mean())
+        gap_std.append(gaps.std())  # population std; few groups at large sizes
+
+    return plot_gap_vs_sketch_size(
+        np.array(xs),
+        np.array(gap_mean),
+        np.array(gap_std),
+        color="tab:blue",
+        ylabel="relative gap of score: |empirical - theoretical| / theoretical",
+        title=(
+            f"Relative gap between empirical and theoretical score "
+            f"({data['algorithm']}, $k$={data['k']}, len={data['len']}, rate={fmt_rate(conv['rate'])})"
+        ),
+    )
+
+
+def plot_converge_inverse(data):
+    conv = data["convergence"]
+    true_rate = conv["rate"]
+
+    xs, gap_mean, gap_std = [], [], []
+    for x, means in block_group_means(conv["blocks"]):
+        try:
+            recovered = inverse_prediction(data, means)
+        except ValueError:
+            # empirical mean out of the inverse model's valid range at this
+            # sketch size (only happens for lexichash, and only when noisy);
+            # skip rather than crash
+            continue
+        gaps = np.abs(recovered - true_rate) / true_rate
+        gaps = gaps[np.isfinite(gaps)]
+        if gaps.size == 0:
+            continue
+        xs.append(x)
+        gap_mean.append(gaps.mean())
+        gap_std.append(gaps.std())
+
+    return plot_gap_vs_sketch_size(
+        np.array(xs),
+        np.array(gap_mean),
+        np.array(gap_std),
+        color="tab:orange",
+        ylabel="relative gap of mutation rate: |recovered - truth| / truth",
+        title=(
+            f"Relative gap between recovered and true mutation rate "
+            f"({data['algorithm']}, $k$={data['k']}, len={data['len']}, rate={fmt_rate(conv['rate'])})"
+        ),
+    )
 
 
 def main():
@@ -350,6 +478,12 @@ def main():
 
     if "inverse" in args.plots:
         figs["inverse"] = plot_inverse(data)
+
+    if "converge" in args.plots:
+        figs["convergence"] = plot_converge(data)
+
+    if "converge-inverse" in args.plots:
+        figs["convergence_inverse"] = plot_converge_inverse(data)
 
     if args.out_dir:
         args.out_dir.mkdir(parents=True, exist_ok=True)
