@@ -60,14 +60,14 @@ def fmt_rate(rate):
 
 
 def forward_prediction(data, rho):
-    """Predicted mean drift score at substitution rate(s) `rho`, dispatching on algorithm."""
+    """Theoretical mean drift score at substitution rate(s) `rho`, dispatching on algorithm."""
     if data["algorithm"] == "minhash":
         return mh.score(data["k"], rho)
     return lh.score(data["len"], data["k"], rho)
 
 
 def inverse_prediction(data, score):
-    """Recovered mutation rate from empirical drift score(s), dispatching on algorithm."""
+    """Recovered mutation rate from empirical mean score(s), dispatching on algorithm."""
     if data["algorithm"] == "minhash":
         return mh.inverse(data["k"], score)
     return lh.inverse(data["len"], data["k"], score)
@@ -269,8 +269,13 @@ def plot_drift(data):
     if data["algorithm"] == "minhash":
         p_match = np.array([c["counts"][1] / sum(c["counts"]) for c in drift])
         std = np.sqrt(p_match * (1 - p_match))
-        mean_handle = ax.plot(
-            rates, p_match, color="tab:red", marker="o", markersize=3, label="mean"
+        empirical_handle = ax.plot(
+            rates,
+            p_match,
+            color="tab:red",
+            marker="o",
+            markersize=3,
+            label="empirical mean",
         )[0]
         lo_band, hi_band = np.clip(p_match - std, 0, 1), np.clip(p_match + std, 0, 1)
         ax.fill_between(rates, lo_band, hi_band, color="tab:red", alpha=0.15)
@@ -278,11 +283,26 @@ def plot_drift(data):
         ax.set_ylabel("P(original best hash still wins)")
         ax.yaxis.set_major_locator(MultipleLocator(0.1))
 
-        pred = forward_prediction(data, rates / 100)
-        pred_handle = ax.plot(
-            rates, pred, "--", color="tab:orange", linewidth=bold, label="prediction"
+        theoretical = forward_prediction(data, rates / 100)
+        theoretical_handle = ax.plot(
+            rates,
+            theoretical,
+            "--",
+            color="tab:orange",
+            linewidth=bold,
+            label="theoretical model",
         )[0]
-        legend_handles = [mean_handle, pred_handle]
+
+        theoretical_old = mh.old_score(data["k"], rates / 100)
+        theoretical_old_handle = ax.plot(
+            rates,
+            theoretical_old,
+            ":",
+            color="tab:green",
+            linewidth=bold,
+            label="theoretical model (old approx.)",
+        )[0]
+        legend_handles = [empirical_handle, theoretical_handle, theoretical_old_handle]
     else:
         # LexicHash's drift score is a skewed/bimodal continuous score, so
         # the envelope comes from exact percentiles of the per-point score
@@ -315,26 +335,26 @@ def plot_drift(data):
                 )[0]
             )
 
-        mean = np.array([mean_from_counts(p["counts"]) for p in drift])
-        mean_handle = ax.plot(
+        empirical = np.array([mean_from_counts(p["counts"]) for p in drift])
+        empirical_handle = ax.plot(
             rates,
-            mean,
+            empirical,
             color="black",
             marker="o",
             markersize=3,
             linewidth=bold,
-            label="mean",
+            label="empirical mean",
             zorder=10,
         )[0]
 
-        pred = forward_prediction(data, rates / 100)
-        pred_handle = ax.plot(
+        theoretical = forward_prediction(data, rates / 100)
+        theoretical_handle = ax.plot(
             rates,
-            pred,
+            theoretical,
             "--",
             color="tab:orange",
             linewidth=bold,
-            label="prediction",
+            label="theoretical model",
             zorder=20,
         )[0]
 
@@ -343,7 +363,11 @@ def plot_drift(data):
         ax.yaxis.set_major_locator(MultipleLocator(3))
 
         header = Line2D([], [], linestyle="none", label="percentile")
-        legend_handles = [mean_handle, pred_handle, header] + percentile_handles
+        legend_handles = [
+            empirical_handle,
+            theoretical_handle,
+            header,
+        ] + percentile_handles
 
     ax.set_xlabel("mutation rate")
     ax.xaxis.set_major_locator(MultipleLocator(1))
@@ -388,7 +412,7 @@ def plot_inverse(data):
     ax.yaxis.set_major_formatter(lambda x, _: f"{x:g}%")
     ax.set_aspect("equal")
     fig.suptitle(
-        f"Mutation rate recovery from mean empirical score ({data['algorithm']}, $k$={data['k']}, len={data['len']}, repeat={data['repeat']})"
+        f"Mutation rate recovery from empirical score ({data['algorithm']}, $k$={data['k']}, len={data['len']}, repeat={data['repeat']})"
     )
     ax.legend()
     return fig
@@ -397,15 +421,22 @@ def plot_inverse(data):
 def plot_converge(data):
     conv = data["convergence"]
     pred = forward_prediction(data, conv["rate"])
+    # only minhash has an old, biased approximation to compare against
+    # show_old = data["algorithm"] == "minhash"
+    show_old = False
+    pred_old = mh.old_score(data["k"], conv["rate"]) if show_old else None
 
-    xs, gap_mean, gap_std = [], [], []
+    xs, gap_mean, gap_std, old_gap_mean = [], [], [], []
     for x, means in block_group_means(conv["blocks"]):
         gaps = np.abs(means - pred) / pred
         xs.append(x)
         gap_mean.append(gaps.mean())
         gap_std.append(gaps.std())  # population std; few groups at large sizes
+        if show_old:
+            old_gaps = np.abs(means - pred_old) / pred_old
+            old_gap_mean.append(old_gaps.mean())
 
-    return plot_gap_vs_sketch_size(
+    fig = plot_gap_vs_sketch_size(
         np.array(xs),
         np.array(gap_mean),
         np.array(gap_std),
@@ -416,6 +447,20 @@ def plot_converge(data):
             f"({data['algorithm']}, $k$={data['k']}, len={data['len']}, rate={fmt_rate(conv['rate'])})"
         ),
     )
+
+    if show_old:
+        ax = fig.axes[0]
+        ax.plot(
+            xs,
+            old_gap_mean,
+            color="tab:green",
+            marker="o",
+            markersize=3,
+            label="mean gap (old approx.)",
+        )
+        ax.legend()
+
+    return fig
 
 
 def plot_converge_inverse(data):
