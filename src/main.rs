@@ -29,8 +29,13 @@ struct Args {
     minhash: bool,
     /// Mutation rate at which to track convergence of the empirical mean
     /// drift score to its prediction, as repeats accumulate
-    #[arg(long, default_value_t = 0.05)]
+    #[arg(short, long, default_value_t = 0.05)]
     converge_rate: f64,
+    /// Mutation rate up to which original_drift/gap-rate plots sweep;
+    /// score_histograms/band_transitions always stop at RATES.last() (10%)
+    /// regardless of this value
+    #[arg(short, long, default_value_t = 0.1)]
+    max_mutation_rate: f64,
 }
 
 #[derive(Serialize)]
@@ -53,10 +58,16 @@ struct SecondBestHistogram {
     cardinality_sum: Vec<usize>,
 }
 
+/// Histograms of the drift score at this mutation-rate checkpoint, one per
+/// disjoint group of repeats (`RATE_GROUPS` equal-sized groups by repeat
+/// index). Since repeats are i.i.d., each group's histogram is an
+/// independent sample of the same distribution, letting plot.py compute a
+/// mean and std of the empirical score at this rate instead of only the
+/// single aggregate (which is just these histograms summed).
 #[derive(Serialize)]
 struct OriginalDriftPoint {
     mutations: usize,
-    counts: Vec<usize>,
+    group_counts: Vec<Vec<usize>>,
 }
 
 /// Sum and count of the fixed-rate drift score over one of 50 disjoint,
@@ -115,6 +126,11 @@ fn add_assign(dst: &mut [usize], src: &[usize]) {
     }
 }
 
+// number of disjoint repeat groups tracked at every mutation-rate
+// checkpoint, for the gap-vs-rate plots (mirrors CONVERGENCE_BLOCKS's role
+// for the gap-vs-sketch-size plots, but fixed rather than swept)
+const RATE_GROUPS: usize = 10;
+
 fn run<S: Sim + Send>(args: &Args, algorithm: &str) -> Output {
     let num_states = args.k + 1;
     let drift_buckets = S::drift_buckets(args.k);
@@ -122,12 +138,14 @@ fn run<S: Sim + Send>(args: &Args, algorithm: &str) -> Output {
         .iter()
         .map(|r| (r * args.len as f64).round() as usize)
         .collect();
-    // 50 evenly spaced sample points across the whole mutation range
+    // last RATES checkpoint: score_histograms/band_transitions stop here
     let total_mutations = *checkpoints.last().unwrap();
-    let sample_points: Vec<usize> = (0..=50).map(|p| p * total_mutations / 50).collect();
+    // 50 evenly spaced sample points across the (possibly longer) drift-tracking range
+    let drift_max_mutations = (args.max_mutation_rate * args.len as f64).round() as usize;
+    let sample_points: Vec<usize> = (0..=50).map(|p| p * drift_max_mutations / 50).collect();
     // nearest of those same 50 sample points to the requested convergence rate
     let converge_index =
-        ((args.converge_rate / RATES.last().unwrap() * 50.0).round() as usize).clamp(0, 50);
+        ((args.converge_rate / args.max_mutation_rate * 50.0).round() as usize).clamp(0, 50);
 
     let (
         score_histograms,
@@ -144,7 +162,7 @@ fn run<S: Sim + Send>(args: &Args, algorithm: &str) -> Output {
                 let seq = PackedSeqVec::random(args.len);
                 (sim, seq)
             },
-            |(sim, seq), _| {
+            |(sim, seq), repeat_idx| {
                 let mask = rand::random::<KT>();
                 sim.reset(args.k, mask, seq.as_slice());
 
@@ -153,7 +171,9 @@ fn run<S: Sim + Send>(args: &Args, algorithm: &str) -> Output {
                     vec![SquareMatrix::<usize>::new(num_states); RATES.len() - 1];
                 let mut second_best_hist = vec![vec![0usize; num_states]; RATES.len()];
                 let mut second_best_card_sum = vec![vec![0usize; num_states]; RATES.len()];
-                let mut og_score_hist = vec![vec![0usize; drift_buckets]; sample_points.len()];
+                let mut og_score_hist =
+                    vec![vec![vec![0usize; drift_buckets]; RATE_GROUPS]; sample_points.len()];
+                let group = repeat_idx * RATE_GROUPS / args.repeat;
                 let mut next_sample = 0;
                 let mut converge_score = 0usize;
 
@@ -172,16 +192,23 @@ fn run<S: Sim + Send>(args: &Args, algorithm: &str) -> Output {
                 // trivially at the "identical to original" bucket
                 if sample_points.first() == Some(&0) {
                     let drift = sim.drift_score(og);
-                    og_score_hist[0][drift] += 1;
+                    og_score_hist[0][group][drift] += 1;
                     if converge_index == 0 {
                         converge_score = drift;
                     }
                     next_sample = 1;
                 }
-                for band in 0..RATES.len() - 1 {
-                    for step in checkpoints[band] + 1..=checkpoints[band + 1] {
-                        sim.mutate();
-                        let j = sim.heap().best_score() as usize;
+                // score_histograms/band_transitions only cover steps up to
+                // total_mutations (RATES.last()); og_score_hist/convergence
+                // keep going past that, up to drift_max_mutations
+                let mut band = 0usize;
+                for step in 1..=drift_max_mutations {
+                    sim.mutate();
+                    let j = sim.heap().best_score() as usize;
+                    if step <= total_mutations {
+                        while step > checkpoints[band + 1] {
+                            band += 1;
+                        }
                         band_matrices[band][(i, j)] += 1;
                         score_hist[band + 1][j] += 1;
                         record_second_best(
@@ -189,16 +216,16 @@ fn run<S: Sim + Send>(args: &Args, algorithm: &str) -> Output {
                             &mut second_best_hist[band + 1],
                             &mut second_best_card_sum[band + 1],
                         );
-                        if next_sample < sample_points.len() && step == sample_points[next_sample] {
-                            let drift = sim.drift_score(og);
-                            og_score_hist[next_sample][drift] += 1;
-                            if next_sample == converge_index {
-                                converge_score = drift;
-                            }
-                            next_sample += 1;
-                        }
-                        i = j;
                     }
+                    if next_sample < sample_points.len() && step == sample_points[next_sample] {
+                        let drift = sim.drift_score(og);
+                        og_score_hist[next_sample][group][drift] += 1;
+                        if next_sample == converge_index {
+                            converge_score = drift;
+                        }
+                        next_sample += 1;
+                    }
+                    i = j;
                 }
                 (
                     score_hist,
@@ -217,7 +244,7 @@ fn run<S: Sim + Send>(args: &Args, algorithm: &str) -> Output {
                     vec![SquareMatrix::<usize>::new(num_states); RATES.len() - 1],
                     vec![vec![0usize; num_states]; RATES.len()],
                     vec![vec![0usize; num_states]; RATES.len()],
-                    vec![vec![0usize; drift_buckets]; sample_points.len()],
+                    vec![vec![vec![0usize; drift_buckets]; RATE_GROUPS]; sample_points.len()],
                     Vec::new(),
                 )
             },
@@ -234,8 +261,10 @@ fn run<S: Sim + Send>(args: &Args, algorithm: &str) -> Output {
                 for (ha, hb) in a.3.iter_mut().zip(b.3.iter()) {
                     add_assign(ha, hb);
                 }
-                for (ha, hb) in a.4.iter_mut().zip(b.4.iter()) {
-                    add_assign(ha, hb);
+                for (pa, pb) in a.4.iter_mut().zip(b.4.iter()) {
+                    for (ha, hb) in pa.iter_mut().zip(pb.iter()) {
+                        add_assign(ha, hb);
+                    }
                 }
                 a.5.extend(b.5);
                 a
@@ -256,7 +285,10 @@ fn run<S: Sim + Send>(args: &Args, algorithm: &str) -> Output {
     let original_drift: Vec<OriginalDriftPoint> = sample_points
         .iter()
         .zip(og_score_hist)
-        .map(|(&mutations, counts)| OriginalDriftPoint { mutations, counts })
+        .map(|(&mutations, group_counts)| OriginalDriftPoint {
+            mutations,
+            group_counts,
+        })
         .collect();
 
     // cumulative sum over repeats, in whatever order the parallel reduce

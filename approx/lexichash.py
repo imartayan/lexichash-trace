@@ -114,6 +114,63 @@ def inverse(n, k, target_score, rho_max=1.0, bisect_iters=40, newton_iters=4):
     return rho
 
 
+def alt_score(n, k, rho):
+    """Same as `score`, but with the discrete-substitution survival term
+    (1-rho)^j in place of its small-rho limit exp(-j*rho). Kept for
+    comparison: despite (1-rho)^j being the more "exact" per-prefix survival
+    probability in isolation, this variant fits the simulated data worse
+    than `score` does, since Phi_j and the competition factor w(rho) were
+    derived self-consistently assuming the exp(-j*rho) (continuous-time)
+    approximation, not the discrete one.
+    """
+    rho = np.asarray(rho, dtype=float)
+    j = np.arange(1, k + 1)[:, None]
+    Phi = _phi(k, n)[:, None]
+    w = 1.0 / (1.0 + (_log4(n) - 0.8) * rho)
+    return (Phi + (1.0 - Phi) * w * (1.0 - rho) ** j).sum(0)
+
+
+def _alt_score_and_deriv(n, k, rho):
+    """`alt_score(n, k, rho)` and its exact derivative, both O(k)."""
+    rho = np.asarray(rho, dtype=float)
+    j = np.arange(1, k + 1)[:, None]
+    Phi = _phi(k, n)[:, None]
+    m = _log4(n) - 0.8
+    w = 1.0 / (1.0 + m * rho)
+    e_j = (1.0 - Phi) * (1.0 - rho) ** j
+    e_jm1 = (1.0 - Phi) * (1.0 - rho) ** (j - 1)
+    s = (Phi + e_j * w).sum(0)
+    ds = (-m * w**2 * e_j - w * j * e_jm1).sum(0)
+    return s, ds
+
+
+def alt_inverse(n, k, target_score, rho_max=1.0, bisect_iters=40, newton_iters=4):
+    """Exact inverse of `alt_score`, same bisection + Newton approach as
+    `inverse` (see its docstring)."""
+    target_score = np.asarray(target_score, dtype=float)
+    lo_bound, hi_bound = alt_score(n, k, rho_max).item(), alt_score(n, k, 0.0).item()
+    if np.any(target_score <= lo_bound) or np.any(target_score > hi_bound):
+        raise ValueError(
+            f"score out of range for rho_max={rho_max}: expected "
+            f"{lo_bound:g} < score <= {hi_bound:g}."
+        )
+
+    rho_lo = np.zeros_like(target_score)
+    rho_hi = np.full_like(target_score, rho_max)
+    for _ in range(bisect_iters):
+        mid = 0.5 * (rho_lo + rho_hi)
+        too_high = alt_score(n, k, mid) > target_score
+        rho_lo = np.where(too_high, mid, rho_lo)
+        rho_hi = np.where(too_high, rho_hi, mid)
+    rho = 0.5 * (rho_lo + rho_hi)
+
+    for _ in range(newton_iters):
+        s, ds = _alt_score_and_deriv(n, k, rho)
+        rho = np.clip(rho - (s - target_score) / ds, 0.0, None)
+
+    return rho
+
+
 def _seed(score, m, Sigma_Phi, E0, B1, B2):
     """Closed-form quadratic-in-log seed (see inverse_approx docstring)."""
     R = (score - Sigma_Phi) / E0

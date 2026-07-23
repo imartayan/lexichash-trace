@@ -26,12 +26,16 @@ cp target/release/lexichash-trace .
 | `-t, --threads <N>` | size of the thread pool | all cores |
 | `--minhash` | use MinHash instead of LexicHash | off (LexicHash) |
 | `--converge-rate <RATE>` | mutation rate at which to track convergence of the empirical mean drift score to its prediction | 0.05 |
+| `--max-mutation-rate <RATE>` | mutation rate up to which the drift/gap-rate plots sweep | 0.1 |
 
-Each repeat mutates the sequence one random base at a time, up to 10% of its
-length, running all repeats in parallel. Along the way it samples the current
-best score at the 0%, 0.1%, 1%, 10% mutation-rate checkpoints (and 50 evenly
-spaced points across the whole range for the drift plot), then aggregates
-everything across repeats into the JSON written to stdout.
+Each repeat mutates the sequence one random base at a time, up to
+`--max-mutation-rate` of its length, running all repeats in parallel. Along
+the way it samples the current best score at the 0%, 0.1%, 1%, 10%
+mutation-rate checkpoints (fixed regardless of `--max-mutation-rate`, used
+for the transition/best/second-best plots), and at 50 evenly spaced points
+across the whole `--max-mutation-rate` range (used for the drift/gap-rate
+plots), then aggregates everything across repeats into the JSON written to
+stdout.
 
 ## Plot
 
@@ -51,12 +55,20 @@ It reads the JSON from stdin and generates different plots:
 - score transitions (`transition`)
 - drift of the selected *k*-mer from the original as mutations increase (`drift`)
 - mutation rate recovered from the drift signal vs the true rate (`inverse`)
-- convergence of the empirical mean drift score to its prediction as sketch size grows, at the fixed `--converge-rate` (`converge`)
-- convergence of the mutation rate recovered from that empirical score to the true rate, as sketch size grows (`converge-inverse`)
+- gap between the empirical mean drift score and its theoretical prediction as sketch size grows, at the fixed `--converge-rate` (`gap-size`)
+- gap between the mutation rate recovered from that empirical score and the true rate, as sketch size grows (`inverse-gap-size`)
+- gap between the empirical mean drift score and its theoretical prediction across the whole mutation-rate range (`gap-rate`)
+- gap between the mutation rate recovered from that empirical score and the true rate, across the whole mutation-rate range (`inverse-gap-rate`)
+
+The `gap-size`/`inverse-gap-size` plots use batch means over disjoint groups
+of repeats at the fixed rate to get several independent samples of the gap
+at each sketch size. The `gap-rate`/`inverse-gap-rate` plots use the same
+idea but with a fixed group count (10) at every mutation-rate checkpoint
+instead, sweeping rate rather than sketch size.
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `-p, --plots <best second transition drift inverse converge converge-inverse>` | which plot(s) to generate | all |
+| `-p, --plots <best second transition drift inverse gap-size inverse-gap-size gap-rate inverse-gap-rate>` | which plot(s) to generate | all |
 | `-o, --out-dir <DIR>` | save plots here instead of showing them | show interactively |
 | `-f, --format <pdf svg png>` | output format(s), only used with `-o` | `pdf` |
 

@@ -1,7 +1,7 @@
 """
 Plot score distributions and transition heatmaps from lexichash-trace JSON output.
 
-Usage: cargo r -r -- -k 21 --repeat 1000 | python plot.py [--out-dir DIR] [--format png pdf svg ...] [--plots best second transition drift inverse]
+Usage: cargo r -r -- -k 21 --repeat 1000 | python plot.py [--out-dir DIR] [--format png pdf svg ...] [--plots best second transition drift inverse gap-size inverse-gap-size gap-rate inverse-gap-rate]
 """
 
 import argparse
@@ -24,8 +24,10 @@ ALL_PLOTS = [
     "transition",
     "drift",
     "inverse",
-    "converge",
-    "converge-inverse",
+    "gap-size",
+    "inverse-gap-size",
+    "gap-rate",
+    "inverse-gap-rate",
 ]
 
 
@@ -50,7 +52,18 @@ def parse_args():
         nargs="+",
         choices=ALL_PLOTS,
         default=ALL_PLOTS,
-        help="which plot(s) to generate: best, second, transition, drift, inverse, converge, converge-inverse (default: all)",
+        help=(
+            "which plot(s) to generate: best, second, transition, drift, inverse, "
+            "gap-size, inverse-gap-size, gap-rate, inverse-gap-rate (default: all)"
+        ),
+    )
+    parser.add_argument(
+        "--compare-models",
+        action="store_true",
+        help=(
+            "also show lexichash's alt model / minhash's old model on plots "
+            "that support it, for comparison against the primary model"
+        ),
     )
     return parser.parse_args()
 
@@ -71,6 +84,18 @@ def inverse_prediction(data, score):
     if data["algorithm"] == "minhash":
         return mh.inverse(data["k"], score)
     return lh.inverse(data["len"], data["k"], score)
+
+
+def alt_prediction(data, rho):
+    """Theoretical mean drift score under lexichash's alternative
+    discrete-substitution model (see `lh.alt_score`); lexichash only."""
+    return lh.alt_score(data["len"], data["k"], rho)
+
+
+def alt_inverse_prediction(data, score):
+    """Recovered mutation rate under lexichash's alternative
+    discrete-substitution model (see `lh.alt_inverse`); lexichash only."""
+    return lh.alt_inverse(data["len"], data["k"], score)
 
 
 def block_group_means(blocks, min_groups=10):
@@ -122,7 +147,8 @@ def plot_gap_vs_sketch_size(
 
     ax.set_xlabel("number of sketched $k$-mers")
     ax.set_ylabel(ylabel)
-    fig.suptitle(title)
+    ax.yaxis.set_major_formatter(lambda y, _: f"{y * 100:g}%")
+    fig.suptitle(title, fontsize=11)
     ax.legend()
     return fig
 
@@ -259,15 +285,39 @@ def mean_from_counts(counts):
     return np.dot(counts, np.arange(len(counts))) / total
 
 
-def plot_drift(data):
+def aggregate_counts(point):
+    """Sum an `original_drift` point's per-group histograms into the single
+    histogram aggregated over all repeats."""
+    return np.sum(point["group_counts"], axis=0)
+
+
+def group_means_at_rate(point, algorithm):
+    """Per-group empirical mean score at one `original_drift` point, one
+    value per disjoint repeat group (`RATE_GROUPS` of them)."""
+    counts = np.array(point["group_counts"], dtype=float)
+    if algorithm == "minhash":
+        return counts[:, 1] / counts.sum(axis=1)
+    idx = np.arange(counts.shape[1])
+    return (counts * idx).sum(axis=1) / counts.sum(axis=1)
+
+
+def repeats_per_rate_group(data):
+    """Number of repeats in each of the disjoint groups `group_means_at_rate`
+    draws one sample from, i.e. `repeat // RATE_GROUPS`."""
+    num_groups = len(data["original_drift"][0]["group_counts"])
+    return data["repeat"] // num_groups
+
+
+def plot_drift(data, compare_models=False):
     drift = data["original_drift"]
     rates = np.array([p["mutations"] for p in drift]) / data["len"] * 100
+    agg = [aggregate_counts(p) for p in drift]
 
     fig, ax = plt.subplots(figsize=(8.5, 4.5), layout="constrained")
     bold = 2.25
 
     if data["algorithm"] == "minhash":
-        p_match = np.array([c["counts"][1] / sum(c["counts"]) for c in drift])
+        p_match = np.array([a[1] / a.sum() for a in agg])
         std = np.sqrt(p_match * (1 - p_match))
         empirical_handle = ax.plot(
             rates,
@@ -292,17 +342,19 @@ def plot_drift(data):
             linewidth=bold,
             label="theoretical model",
         )[0]
+        legend_handles = [empirical_handle, theoretical_handle]
 
-        theoretical_old = mh.old_score(data["k"], rates / 100)
-        theoretical_old_handle = ax.plot(
-            rates,
-            theoretical_old,
-            ":",
-            color="tab:green",
-            linewidth=bold,
-            label="theoretical model (old approx.)",
-        )[0]
-        legend_handles = [empirical_handle, theoretical_handle, theoretical_old_handle]
+        if compare_models:
+            theoretical_old = mh.old_score(data["k"], rates / 100)
+            theoretical_old_handle = ax.plot(
+                rates,
+                theoretical_old,
+                ":",
+                color="tab:green",
+                linewidth=bold,
+                label="theoretical model (old approx.)",
+            )[0]
+            legend_handles.append(theoretical_old_handle)
     else:
         # LexicHash's drift score is a skewed/bimodal continuous score, so
         # the envelope comes from exact percentiles of the per-point score
@@ -312,8 +364,7 @@ def plot_drift(data):
         colors = cmap(np.linspace(0, 1, len(percentiles)))
 
         vals_list = [
-            np.array([percentile_from_counts(p["counts"], q) for p in drift])
-            for q in percentiles
+            np.array([percentile_from_counts(a, q) for a in agg]) for q in percentiles
         ]
         for lo_vals, hi_vals, color in zip(vals_list, vals_list[1:], colors):
             ax.fill_between(rates, lo_vals, hi_vals, color=color, alpha=0.15, zorder=0)
@@ -335,7 +386,7 @@ def plot_drift(data):
                 )[0]
             )
 
-        empirical = np.array([mean_from_counts(p["counts"]) for p in drift])
+        empirical = np.array([mean_from_counts(a) for a in agg])
         empirical_handle = ax.plot(
             rates,
             empirical,
@@ -358,19 +409,30 @@ def plot_drift(data):
             zorder=20,
         )[0]
 
+        legend_handles = [empirical_handle, theoretical_handle]
+
+        if compare_models:
+            theoretical_alt = alt_prediction(data, rates / 100)
+            theoretical_alt_handle = ax.plot(
+                rates,
+                theoretical_alt,
+                ":",
+                color="tab:green",
+                linewidth=bold,
+                label="theoretical model (alt)",
+                zorder=20,
+            )[0]
+            legend_handles.append(theoretical_alt_handle)
+
         ax.set_ylim(0, data["k"] + 1)
         ax.set_ylabel("shared prefix length with original best $k$-mer")
         ax.yaxis.set_major_locator(MultipleLocator(3))
 
         header = Line2D([], [], linestyle="none", label="percentile")
-        legend_handles = [
-            empirical_handle,
-            theoretical_handle,
-            header,
-        ] + percentile_handles
+        legend_handles += [header] + percentile_handles
 
     ax.set_xlabel("mutation rate")
-    ax.xaxis.set_major_locator(MultipleLocator(1))
+    ax.xaxis.set_major_locator(MultipleLocator(2))
     ax.xaxis.set_major_formatter(lambda x, _: f"{x:g}%")
     fig.suptitle(
         f"Best $k$-mer drift from original ({data['algorithm']}, $k$={data['k']}, len={data['len']}, repeat={data['repeat']})"
@@ -379,15 +441,16 @@ def plot_drift(data):
     return fig
 
 
-def plot_inverse(data):
+def plot_inverse(data, compare_models=False):
     drift = data["original_drift"]
     n = data["len"]
     rates = np.array([p["mutations"] for p in drift]) / n * 100
+    agg = [aggregate_counts(p) for p in drift]
 
     if data["algorithm"] == "minhash":
-        scores = np.array([c["counts"][1] / sum(c["counts"]) for c in drift])
+        scores = np.array([a[1] / a.sum() for a in agg])
     else:
-        scores = np.array([mean_from_counts(p["counts"]) for p in drift])
+        scores = np.array([mean_from_counts(a) for a in agg])
     recovered = inverse_prediction(data, scores) * 100
     label = "inverse(empirical score)"
 
@@ -404,6 +467,21 @@ def plot_inverse(data):
         markersize=3,
         label=label,
     )
+
+    if compare_models and data["algorithm"] != "minhash":
+        try:
+            recovered_alt = alt_inverse_prediction(data, scores) * 100
+            ax.plot(
+                rates,
+                recovered_alt,
+                color="tab:green",
+                marker="o",
+                markersize=3,
+                label="inverse(empirical score) (alt)",
+            )
+        except ValueError:
+            pass  # empirical mean out of the alt model's valid range somewhere
+
     ax.set_xlim(0, lim)
     ax.set_ylim(0, lim)
     ax.set_xlabel("true mutation rate")
@@ -418,15 +496,17 @@ def plot_inverse(data):
     return fig
 
 
-def plot_converge(data):
+def plot_gap_size(data, compare_models=False):
     conv = data["convergence"]
     pred = forward_prediction(data, conv["rate"])
     # only minhash has an old, biased approximation to compare against
-    # show_old = data["algorithm"] == "minhash"
-    show_old = False
+    show_old = compare_models and data["algorithm"] == "minhash"
     pred_old = mh.old_score(data["k"], conv["rate"]) if show_old else None
+    # only lexichash has the alternative discrete-substitution model
+    show_alt = compare_models and data["algorithm"] != "minhash"
+    pred_alt = alt_prediction(data, conv["rate"]) if show_alt else None
 
-    xs, gap_mean, gap_std, old_gap_mean = [], [], [], []
+    xs, gap_mean, gap_std, old_gap_mean, alt_gap_mean = [], [], [], [], []
     for x, means in block_group_means(conv["blocks"]):
         gaps = np.abs(means - pred) / pred
         xs.append(x)
@@ -435,6 +515,9 @@ def plot_converge(data):
         if show_old:
             old_gaps = np.abs(means - pred_old) / pred_old
             old_gap_mean.append(old_gaps.mean())
+        if show_alt:
+            alt_gaps = np.abs(means - pred_alt) / pred_alt
+            alt_gap_mean.append(alt_gaps.mean())
 
     fig = plot_gap_vs_sketch_size(
         np.array(xs),
@@ -447,9 +530,9 @@ def plot_converge(data):
             f"({data['algorithm']}, $k$={data['k']}, len={data['len']}, rate={fmt_rate(conv['rate'])})"
         ),
     )
+    ax = fig.axes[0]
 
     if show_old:
-        ax = fig.axes[0]
         ax.plot(
             xs,
             old_gap_mean,
@@ -460,31 +543,56 @@ def plot_converge(data):
         )
         ax.legend()
 
+    if show_alt:
+        ax.plot(
+            xs,
+            alt_gap_mean,
+            color="tab:green",
+            marker="o",
+            markersize=3,
+            label="mean gap (alt)",
+        )
+        ax.legend()
+
     return fig
 
 
-def plot_converge_inverse(data):
+def plot_inverse_gap_size(data, compare_models=False):
     conv = data["convergence"]
     true_rate = conv["rate"]
+    # only lexichash has the alternative discrete-substitution model
+    show_alt = compare_models and data["algorithm"] != "minhash"
 
     xs, gap_mean, gap_std = [], [], []
+    alt_xs, alt_gap_mean, alt_gap_std = [], [], []
     for x, means in block_group_means(conv["blocks"]):
         try:
             recovered = inverse_prediction(data, means)
+            gaps = np.abs(recovered - true_rate) / true_rate
+            gaps = gaps[np.isfinite(gaps)]
+            if gaps.size:
+                xs.append(x)
+                gap_mean.append(gaps.mean())
+                gap_std.append(gaps.std())
         except ValueError:
             # empirical mean out of the inverse model's valid range at this
             # sketch size (only happens for lexichash, and only when noisy);
             # skip rather than crash
-            continue
-        gaps = np.abs(recovered - true_rate) / true_rate
-        gaps = gaps[np.isfinite(gaps)]
-        if gaps.size == 0:
-            continue
-        xs.append(x)
-        gap_mean.append(gaps.mean())
-        gap_std.append(gaps.std())
+            pass
 
-    return plot_gap_vs_sketch_size(
+        if show_alt:
+            try:
+                recovered_alt = alt_inverse_prediction(data, means)
+                alt_gaps = np.abs(recovered_alt - true_rate) / true_rate
+                alt_gaps = alt_gaps[np.isfinite(alt_gaps)]
+                if alt_gaps.size:
+                    alt_xs.append(x)
+                    alt_gap_mean.append(alt_gaps.mean())
+                    alt_gap_std.append(alt_gaps.std())
+            except ValueError:
+                pass
+
+    fig = plot_gap_vs_sketch_size(
         np.array(xs),
         np.array(gap_mean),
         np.array(gap_std),
@@ -495,6 +603,154 @@ def plot_converge_inverse(data):
             f"({data['algorithm']}, $k$={data['k']}, len={data['len']}, rate={fmt_rate(conv['rate'])})"
         ),
     )
+
+    if show_alt:
+        ax = fig.axes[0]
+        ax.plot(
+            alt_xs,
+            alt_gap_mean,
+            color="tab:green",
+            marker="o",
+            markersize=3,
+            label="mean gap (alt)",
+        )
+        ax.legend()
+
+    return fig
+
+
+def plot_gap_vs_rate(xs, gap_mean, gap_std, color, ylabel, title):
+    fig, ax = plt.subplots(figsize=(8.5, 4.5), layout="constrained")
+    lo = np.clip(gap_mean - gap_std, 0, None)
+    ax.fill_between(xs, lo, gap_mean + gap_std, color=color, alpha=0.15)
+    ax.plot(xs, gap_mean, color=color, marker="o", markersize=3, label="mean gap")
+
+    ax.set_xlabel("mutation rate")
+    ax.set_ylabel(ylabel)
+    ax.yaxis.set_major_formatter(lambda y, _: f"{y * 100:g}%")
+    ax.xaxis.set_major_locator(MultipleLocator(2))
+    ax.xaxis.set_major_formatter(lambda x, _: f"{x:g}%")
+    fig.suptitle(title, fontsize=11)
+    ax.legend()
+    return fig
+
+
+def plot_gap_rate(data, compare_models=False):
+    drift = data["original_drift"]
+    rates = np.array([p["mutations"] for p in drift]) / data["len"] * 100
+    # only lexichash has the alternative discrete-substitution model
+    show_alt = compare_models and data["algorithm"] != "minhash"
+
+    # RATE_GROUPS disjoint repeat groups at every rate checkpoint (see
+    # `original_drift` in the Rust output) are i.i.d., so their means give
+    # RATE_GROUPS independent samples of the gap at that rate, the same
+    # batch-means trick as plot_gap_size but with a fixed group count and
+    # mutation rate as the swept axis instead of sketch size.
+    gap_mean, gap_std, alt_gap_mean = [], [], []
+    for point, rate in zip(drift, rates):
+        means = group_means_at_rate(point, data["algorithm"])
+        pred = forward_prediction(data, rate / 100)
+        gaps = np.abs(means - pred) / pred
+        gap_mean.append(gaps.mean())
+        gap_std.append(gaps.std())
+        if show_alt:
+            pred_alt = alt_prediction(data, rate / 100)
+            alt_gaps = np.abs(means - pred_alt) / pred_alt
+            alt_gap_mean.append(alt_gaps.mean())
+
+    fig = plot_gap_vs_rate(
+        rates,
+        np.array(gap_mean),
+        np.array(gap_std),
+        color="tab:blue",
+        ylabel="relative gap of score: |empirical - theoretical| / theoretical",
+        title=(
+            f"Relative gap between empirical and theoretical score "
+            f"({data['algorithm']}, $k$={data['k']}, len={data['len']}, "
+            f"repeat/group={repeats_per_rate_group(data)})"
+        ),
+    )
+
+    if show_alt:
+        ax = fig.axes[0]
+        ax.plot(
+            rates,
+            alt_gap_mean,
+            color="tab:green",
+            marker="o",
+            markersize=3,
+            label="mean gap (alt)",
+        )
+        ax.legend()
+
+    return fig
+
+
+def plot_inverse_gap_rate(data, compare_models=False):
+    drift = data["original_drift"]
+    rates = np.array([p["mutations"] for p in drift]) / data["len"] * 100
+    # only lexichash has the alternative discrete-substitution model
+    show_alt = compare_models and data["algorithm"] != "minhash"
+
+    xs, gap_mean, gap_std = [], [], []
+    alt_xs, alt_gap_mean, alt_gap_std = [], [], []
+    for point, rate in zip(drift, rates):
+        if rate == 0:
+            continue  # true rate is 0 here, relative gap is undefined
+        means = group_means_at_rate(point, data["algorithm"])
+        true_rate = rate / 100
+
+        try:
+            recovered = inverse_prediction(data, means)
+            gaps = np.abs(recovered - true_rate) / true_rate
+            gaps = gaps[np.isfinite(gaps)]
+            if gaps.size:
+                xs.append(rate)
+                gap_mean.append(gaps.mean())
+                gap_std.append(gaps.std())
+        except ValueError:
+            # empirical mean out of the inverse model's valid range for one
+            # of the groups at this rate; skip rather than crash
+            pass
+
+        if show_alt:
+            try:
+                recovered_alt = alt_inverse_prediction(data, means)
+                alt_gaps = np.abs(recovered_alt - true_rate) / true_rate
+                alt_gaps = alt_gaps[np.isfinite(alt_gaps)]
+                if alt_gaps.size:
+                    alt_xs.append(rate)
+                    alt_gap_mean.append(alt_gaps.mean())
+                    alt_gap_std.append(alt_gaps.std())
+            except ValueError:
+                pass
+
+    fig = plot_gap_vs_rate(
+        np.array(xs),
+        np.array(gap_mean),
+        np.array(gap_std),
+        color="tab:orange",
+        ylabel="relative gap of mutation rate: |recovered - truth| / truth",
+        title=(
+            f"Relative gap between recovered and true mutation rate "
+            f"({data['algorithm']}, $k$={data['k']}, len={data['len']}, "
+            f"repeat/group={repeats_per_rate_group(data)})"
+        ),
+    )
+
+    if show_alt:
+        ax = fig.axes[0]
+        ax.plot(
+            alt_xs,
+            alt_gap_mean,
+            color="tab:green",
+            marker="o",
+            markersize=3,
+            label="mean gap (alt)",
+        )
+        ax.legend()
+
+    return fig
 
 
 def main():
@@ -519,16 +775,22 @@ def main():
         figs["transitions"] = plot_transition(data, lo, hi)
 
     if "drift" in args.plots:
-        figs["drift"] = plot_drift(data)
+        figs["drift"] = plot_drift(data, args.compare_models)
 
     if "inverse" in args.plots:
-        figs["inverse"] = plot_inverse(data)
+        figs["inverse"] = plot_inverse(data, args.compare_models)
 
-    if "converge" in args.plots:
-        figs["convergence"] = plot_converge(data)
+    if "gap-size" in args.plots:
+        figs["gap_size"] = plot_gap_size(data, args.compare_models)
 
-    if "converge-inverse" in args.plots:
-        figs["convergence_inverse"] = plot_converge_inverse(data)
+    if "inverse-gap-size" in args.plots:
+        figs["inverse_gap_size"] = plot_inverse_gap_size(data, args.compare_models)
+
+    if "gap-rate" in args.plots:
+        figs["gap_rate"] = plot_gap_rate(data, args.compare_models)
+
+    if "inverse-gap-rate" in args.plots:
+        figs["inverse_gap_rate"] = plot_inverse_gap_rate(data, args.compare_models)
 
     if args.out_dir:
         args.out_dir.mkdir(parents=True, exist_ok=True)
