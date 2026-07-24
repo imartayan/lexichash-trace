@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use packed_seq::{PackedSeqVec, SeqVec};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -8,6 +8,13 @@ use lexichash_trace::matrix::SquareMatrix;
 use lexichash_trace::sim::{LexicHashSim, MinHashSim, Sim};
 
 const RATES: [f64; 4] = [0.0, 0.001, 0.01, 0.1];
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum Sketch {
+    Lexichash,
+    Minhash,
+    Both,
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -24,9 +31,11 @@ struct Args {
     /// Number of threads [default: all]
     #[arg(short, long)]
     threads: Option<usize>,
-    /// Use MinHash instead of LexicHash
-    #[arg(long)]
-    minhash: bool,
+    /// Which sketch algorithm(s) to simulate; "both" runs each
+    /// independently (separate random sequences) and emits both in the
+    /// output array
+    #[arg(short, long, value_enum, default_value_t = Sketch::Lexichash)]
+    sketch: Sketch,
     /// Mutation rate at which to track convergence of the empirical mean
     /// drift score to its prediction, as repeats accumulate
     #[arg(short, long, default_value_t = 0.05)]
@@ -111,13 +120,15 @@ fn main() {
             .unwrap();
     }
 
-    let output = if args.minhash {
-        run::<MinHashSim>(&args, "minhash")
-    } else {
-        run::<LexicHashSim>(&args, "lexichash")
-    };
+    let mut outputs = Vec::new();
+    if matches!(args.sketch, Sketch::Lexichash | Sketch::Both) {
+        outputs.push(run::<LexicHashSim>(&args, "lexichash"));
+    }
+    if matches!(args.sketch, Sketch::Minhash | Sketch::Both) {
+        outputs.push(run::<MinHashSim>(&args, "minhash"));
+    }
 
-    serde_json::to_writer(std::io::stdout().lock(), &output).unwrap();
+    serde_json::to_writer(std::io::stdout().lock(), &outputs).unwrap();
 }
 
 fn add_assign(dst: &mut [usize], src: &[usize]) {
@@ -143,9 +154,11 @@ fn run<S: Sim + Send>(args: &Args, algorithm: &str) -> Output {
     // 50 evenly spaced sample points across the (possibly longer) drift-tracking range
     let drift_max_mutations = (args.max_mutation_rate * args.len as f64).round() as usize;
     let sample_points: Vec<usize> = (0..=50).map(|p| p * drift_max_mutations / 50).collect();
-    // nearest of those same 50 sample points to the requested convergence rate
-    let converge_index =
-        ((args.converge_rate / args.max_mutation_rate * 50.0).round() as usize).clamp(0, 50);
+    // exact mutation count for the requested convergence rate, independent
+    // of the 50-point sample_points grid so it isn't limited to whatever
+    // that grid's granularity happens to allow
+    let converge_mutations =
+        ((args.converge_rate * args.len as f64).round() as usize).min(drift_max_mutations);
 
     let (
         score_histograms,
@@ -191,12 +204,11 @@ fn run<S: Sim + Send>(args: &Args, algorithm: &str) -> Output {
                 // loop below, since steps there start at 1: record it here,
                 // trivially at the "identical to original" bucket
                 if sample_points.first() == Some(&0) {
-                    let drift = sim.drift_score(og);
-                    og_score_hist[0][group][drift] += 1;
-                    if converge_index == 0 {
-                        converge_score = drift;
-                    }
+                    og_score_hist[0][group][sim.drift_score(og)] += 1;
                     next_sample = 1;
+                }
+                if converge_mutations == 0 {
+                    converge_score = sim.drift_score(og);
                 }
                 // score_histograms/band_transitions only cover steps up to
                 // total_mutations (RATES.last()); og_score_hist/convergence
@@ -218,12 +230,11 @@ fn run<S: Sim + Send>(args: &Args, algorithm: &str) -> Output {
                         );
                     }
                     if next_sample < sample_points.len() && step == sample_points[next_sample] {
-                        let drift = sim.drift_score(og);
-                        og_score_hist[next_sample][group][drift] += 1;
-                        if next_sample == converge_index {
-                            converge_score = drift;
-                        }
+                        og_score_hist[next_sample][group][sim.drift_score(og)] += 1;
                         next_sample += 1;
+                    }
+                    if step == converge_mutations {
+                        converge_score = sim.drift_score(og);
                     }
                     i = j;
                 }
@@ -311,8 +322,8 @@ fn run<S: Sim + Send>(args: &Args, algorithm: &str) -> Output {
         .map(|p| p * args.repeat / CONVERGENCE_BLOCKS)
         .collect();
     let convergence = Convergence {
-        rate: sample_points[converge_index] as f64 / args.len as f64,
-        mutations: sample_points[converge_index],
+        rate: converge_mutations as f64 / args.len as f64,
+        mutations: converge_mutations,
         blocks: edges
             .windows(2)
             .map(|w| ConvergenceBlock {
